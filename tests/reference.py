@@ -92,6 +92,25 @@ def _noise(seed, length, scale):
     return out
 
 
+def _fir_frame(frame, taps):
+    """独立实现的固定复数 FIR：y[n]=Σ_l taps[l]·x[n-l]。
+
+    帧起点之前视为静默（x[n]=0, n<0）；输出截成与帧等长，
+    帧尾拖尾落入后续噪声/被截断，接收机不使用它。
+    独立于被测核心，不共享任何实现。
+    """
+    taps = [complex(t) for t in taps]
+    assert 1 <= len(taps) <= 3
+    out = [0j] * len(frame)
+    for i, x in enumerate(frame):
+        acc = 0j
+        for l, h in enumerate(taps):
+            if i - l >= 0:
+                acc += h * frame[i - l]
+        out[i] = acc
+    return out
+
+
 def transmit(
     bits,
     *,
@@ -102,6 +121,7 @@ def transmit(
     inband_scale=0.0,
     trailing=0,
     zero_pilots=False,
+    taps=None,
     seed=1234,
     truncate=None,
 ):
@@ -109,11 +129,15 @@ def transmit(
 
     time_offset: 帧前噪声样本数（时偏=该整数）。
     cfo: 频偏，单位载波间隔，乘子 exp(j2π f n/32)（n 为帧内序号）。
-    gain: 单一复增益。
+    gain: 单一复增益（平坦分量）。
+    taps: 可选 1..3 个固定复数 FIR 抽头；信道输出为 FIR 后再乘
+        gain 与频偏（与接收机的抽头估计吸收该增益一致）。
     front_scale: 前置噪声幅度；inband_scale: 叠加在帧上的噪声幅度。
     trailing: 帧后噪声样本数；truncate: 从帧起点起保留的总样本上限。
     """
     frame = build_frame(bits, zero_pilots=zero_pilots)
+    if taps is not None:
+        frame = _fir_frame(frame, taps)
     gained = []
     for n, x in enumerate(frame):
         y = x * complex(gain) * cmath.exp(2j * math.pi * cfo * n / N)
