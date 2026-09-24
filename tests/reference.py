@@ -81,6 +81,19 @@ def build_frame(bits, *, zero_pilots=False):
     return frame
 
 
+def _fir(x, taps):
+    """独立朴素因果 FIR：y[n] = Σ_l taps[l]·x[n-l]（n-l<0 项视为 0）。"""
+    out = []
+    ht = [complex(t) for t in taps]
+    for n in range(len(x)):
+        v = 0j
+        for l, h in enumerate(ht):
+            if n - l >= 0:
+                v += h * x[n - l]
+        out.append(v)
+    return out
+
+
 def _noise(seed, length, scale):
     rng = random.Random(seed)
     out = []
@@ -102,6 +115,7 @@ def transmit(
     inband_scale=0.0,
     trailing=0,
     zero_pilots=False,
+    taps=(1.0 + 0j,),
     seed=1234,
     truncate=None,
 ):
@@ -109,13 +123,16 @@ def transmit(
 
     time_offset: 帧前噪声样本数（时偏=该整数）。
     cfo: 频偏，单位载波间隔，乘子 exp(j2π f n/32)（n 为帧内序号）。
-    gain: 单一复增益。
+    gain: 单一复增益（在 FIR 之后施加，故接收端抽头真值为 gain·taps[l]）。
+    taps: 最多 3 抽头的固定复数 FIR 系数（因果，先经过 FIR 再乘增益/频偏）。
     front_scale: 前置噪声幅度；inband_scale: 叠加在帧上的噪声幅度。
     trailing: 帧后噪声样本数；truncate: 从帧起点起保留的总样本上限。
     """
+    assert 1 <= len(taps) <= 3
     frame = build_frame(bits, zero_pilots=zero_pilots)
+    convolved = _fir(frame, taps)
     gained = []
-    for n, x in enumerate(frame):
+    for n, x in enumerate(convolved):
         y = x * complex(gain) * cmath.exp(2j * math.pi * cfo * n / N)
         gained.append(y)
 
