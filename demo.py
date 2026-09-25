@@ -69,7 +69,55 @@ def main() -> int:
         return 1
 
     print("\n演示完成：1 个正常恢复 + 1 个实际触发的拒绝，均为实时计算。")
-    return 0
+
+    # 3) 多帧扫描：一个有限缓冲区内放两个频偏不同的相邻帧，
+    #    再加一个前导形似但导频错误的假峰，用 scan_frames 一次扫出。
+    print("\n" + "=" * 64)
+    print("多帧扫描演示（scan_frames）：相邻双帧 + 导频错误的假峰")
+    print("=" * 64)
+    bits_b = [1 - b for b in bits]
+    expected_b = "".join(str(b) for b in bits_b)
+    cfo_a, cfo_b = 0.11, -0.23
+    fa = R.apply_channel(R.build_frame(bits), cfo=cfo_a, gain=1.3 * cmath.exp(0.4j))
+    fb = R.apply_channel(R.build_frame(bits_b), cfo=cfo_b, gain=0.9 * cmath.exp(-0.7j))
+    fake = R.apply_channel(R.build_frame(bits, fake_pilots=True), cfo=0.05)
+    buf = list(R._noise(1, 20, 0.05))
+    a0 = len(buf)
+    buf += fa
+    b0 = len(buf)
+    buf += fb
+    buf += R._noise(2, 16, 0.05)
+    f0 = len(buf)
+    buf += fake
+    buf += R._noise(3, 30, 0.05)
+
+    t0 = time.perf_counter()
+    scan = O.scan_frames(buf)
+    dt = time.perf_counter() - t0
+
+    print(f"\n缓冲区长度 = {len(buf)} 样本；真实布局: 帧A@{a0} (cfo {cfo_a:+.2f}), "
+          f"帧B@{b0} (cfo {cfo_b:+.2f}), 假峰@{f0}")
+    print(f"扫描耗时: {dt * 1000:.1f} ms")
+    print(f"\n[输出帧] 共 {len(scan.frames)} 帧（互不重叠、按起点升序）:")
+    for i, fr in enumerate(scan.frames):
+        truth_bits = expected if fr.start == a0 else expected_b
+        print(f"  帧{i}: start={fr.start}  f={fr.frequency_offset:+.6f}  "
+              f"residual={fr.residual:.6f}")
+        print(f"       bits 匹配: {fr.bits == truth_bits}")
+    print(f"\n[拒绝] 共 {len(scan.rejected)} 个候选（含假峰及其旁瓣）:")
+    for rej in scan.rejected:
+        tag = " <-- 假峰" if rej.start == f0 else ""
+        print(f"  start={rej.start}  reason={rej.reason}{tag}")
+        if rej.start == f0:
+            print(f"       {rej.detail}")
+    print(f"\n[截断] 共 {len(scan.truncated)} 个尾部不完整帧（另列，未补零解码）")
+    ok = (
+        [f.start for f in scan.frames] == [a0, b0]
+        and any(r.start == f0 and r.reason == O.REASON_PILOT_RESIDUAL
+                for r in scan.rejected)
+    )
+    print("扫描结果与真实布局一致:", ok)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

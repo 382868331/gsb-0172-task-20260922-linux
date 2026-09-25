@@ -59,8 +59,13 @@ def _preamble_block():
     ]
 
 
-def build_frame(bits, *, zero_pilots=False):
-    """按题面布局直接合成一帧（112 样本），未经信道、无时偏。"""
+def build_frame(bits, *, zero_pilots=False, fake_pilots=False):
+    """按题面布局直接合成一帧（112 样本），未经信道、无时偏。
+
+    zero_pilots: 导频载波置零（零导频能量边界）。
+    fake_pilots: 前导保持正常，但 ±7 导频位置填入确定性的错误 QPSK 值
+        （用于构造“前导形似但导频错误”的假峰）。
+    """
     assert len(bits) == 48
     block = _preamble_block()
     frame = list(block) + list(block)
@@ -71,7 +76,12 @@ def build_frame(bits, *, zero_pilots=False):
         carriers = [-6, -5, -4, -3, -2, -1, 1, 2, 3, 4, 5, 6]
         for j, kc in enumerate(carriers):
             X[kc % N] = syms[s * 12 + j]
-        if not zero_pilots:
+        if fake_pilots:
+            # 两载波都填错误值，且相对已知模式 (p7=+1, p25=-1) 不对称，
+            # 使单一复增益无法同时拟合四个导频观测（导频残差显著非零）。
+            X[7] = complex(SQRT1_2, SQRT1_2)      # 应为 +1
+            X[-7 % N] = complex(SQRT1_2, -SQRT1_2)  # 应为 -1
+        elif not zero_pilots:
             X[7] = 1 + 0j    # +7 导频
             X[-7 % N] = -1 + 0j  # -7 导频（索引 25）
         time = _idft(X)
@@ -79,6 +89,15 @@ def build_frame(bits, *, zero_pilots=False):
         frame.extend(time)
     assert len(frame) == FRAME_LEN
     return frame
+
+
+def apply_channel(frame, *, cfo=0.0, gain=1.0 + 0j):
+    """对帧样本施加已知频偏与复增益（n 为帧内序号）。"""
+    g = complex(gain)
+    return [
+        x * g * cmath.exp(2j * math.pi * cfo * n / N)
+        for n, x in enumerate(frame)
+    ]
 
 
 def _noise(seed, length, scale):
@@ -114,10 +133,7 @@ def transmit(
     trailing: 帧后噪声样本数；truncate: 从帧起点起保留的总样本上限。
     """
     frame = build_frame(bits, zero_pilots=zero_pilots)
-    gained = []
-    for n, x in enumerate(frame):
-        y = x * complex(gain) * cmath.exp(2j * math.pi * cfo * n / N)
-        gained.append(y)
+    gained = apply_channel(frame, cfo=cfo, gain=gain)
 
     front = _noise(seed, time_offset, front_scale) if front_scale else [
         0j

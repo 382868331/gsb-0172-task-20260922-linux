@@ -17,18 +17,19 @@ N=32 / CP=8 的合成帧，估计载波频偏并补偿，去循环前缀后自�
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试，约 0.05 s
-python demo.py                            # 固定输入演示，实测 < 0.1 s（远低于约 8 s 预算）
+python -m unittest discover -s tests -v   # 必要测试（44 个），约 0.1 s
+python demo.py                            # 固定输入演示，实测 < 0.2 s（远低于 90 s 预算）
 ```
 
 ## 仓库结构
 
 ```
 ofdm_recovery/__init__.py   公开接口导出
-ofdm_recovery/core.py       核心库（DFT、候选搜索、解码、错误类型）
+ofdm_recovery/core.py       核心库（DFT、候选搜索、单帧解码、多帧扫描、错误类型）
 tests/reference.py          独立直接合成器（不导入被测核心；期望值的唯一来源）
-tests/test_ofdm.py          必要测试（24 个）
-demo.py                     固定输入 demo：1 个正常恢复 + 1 个实际触发的拒绝
+tests/test_ofdm.py          单帧接口必要测试（24 个）
+tests/test_scan.py          多帧扫描接口必要测试（20 个）
+demo.py                     固定输入 demo：单帧正常恢复 + 截断拒绝 + 多帧扫描
 ```
 
 `tests/reference.py` 是与核心互相独立的发射端实现：朴素 IDFT、独立前导序列、
@@ -55,7 +56,10 @@ QPSK 星座为 `±(1+j)/√2`。位映射：每位对应一个坐标，实部在
 ## 公开接口
 
 ```python
-from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeResult
+from ofdm_recovery import (
+    decode, find_candidates, scan_frames, dft, symbols_to_bits,
+    DecodeResult, ScanResult,
+)
 ```
 
 ### `decode(signal, *, rho_threshold=0.85, residual_threshold=0.35, max_candidates=1024) -> DecodeResult`
@@ -81,6 +85,48 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 最早位置确定性平局。`Candidate` 字段：`start / frequency_offset / residual / coherence`。
 
 其余接口：`dft(x)`（任意长度朴素 DFT，无归一化）、`symbols_to_bits(symbols)`。
+
+### `scan_frames(signal, *, rho_threshold=0.85, residual_threshold=0.35, pilot_threshold=0.35, max_candidates=1024) -> ScanResult`
+
+**多帧扫描接口**：在有限缓冲区（长度 ≤512）内一次扫出多帧。流程：
+
+1. 用与 `find_candidates` 相同的前导相关枚举**全部**候选起点；
+2. 对每个候选**独立**求频偏、前导残差、导频残差与完整性，质量门限逐项把关
+   （顺序：前导残差 → 频偏范围 → 完整性 → 导频能量 → 导频残差）；
+3. 对通过门限的候选池做**区间动态规划**，选出互不重叠（区间
+   `[start, start+112)` 不相交）的最优帧组；
+4. 对选中的帧逐一解码输出。
+
+返回不可变 `ScanResult`（全部为按起点升序的元组）：
+
+| 字段 | 含义 |
+|---|---|
+| `frames` | 选中的互不重叠帧的 `DecodeResult`（与单帧接口同一结构） |
+| `pool` | 通过全部质量门限的候选 `EvaluatedCandidate(start, frequency_offset, residual, pilot_residual)` |
+| `rejected` | 被拒绝的候选 `FrameRejection(start, reason, detail)` |
+| `truncated` | 尾部不完整帧 `TruncatedFrame(start, available, needed)`，只另列、**不补零当完整帧** |
+
+导频残差 `pilot_residual = sqrt(Σ|Y−h·p|² / Σ|Y|²)`（两符号 × 两导频共 4 个观测，
+`h` 为最小二乘复增益）：干净帧为 0；“前导形似但导频错误”的假峰显著大于 0，
+超过 `pilot_threshold` 即拒绝。
+
+**选择规则**（严格按此字典序，确定性）：① 完整可解帧数最多；② 前导残差总和
+最小；③ 起点序列字典序最小。区间 DP 按起点排序后做后缀转移
+`best[i] = max(跳过 i, 选 i + best[首个不冲突候选])`，不会因为看见第一个相关峰
+就跳过后面整段；`tests/test_scan.py` 用候选池子集的暴力枚举独立核对最优性。
+
+**拒绝原因代码**（`FrameRejection.reason`，对应 `REASON_*` 导出常量）：
+
+| reason | 触发条件 |
+|---|---|
+| `preamble_residual` | 前导残差 > `residual_threshold` |
+| `frequency_offset` | 频偏估计 `|f| ≥ 0.5` |
+| `zero_pilot_energy` | 导频能量低于相对底限，无法估计增益 |
+| `pilot_residual` | 导频残差 > `pilot_threshold`（导频内容与已知 ±7 不符） |
+
+缓冲区内没有任何候选时返回全空的 `ScanResult`（批量扫描下空结果是正常情况，
+不是错误）；输入非法仍抛 `SignalFormatError`/`ParameterError`，搜索预算耗尽
+仍抛 `SearchBudgetError`。旧单帧接口 `decode` 行为不变。
 
 ### 错误语义（均可定位、不静默纠正）
 
@@ -113,6 +159,11 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
    `h = Σ Y·conj(p)/Σ|p|²`（导频 ±1 时即平均），再逐数据载波 `Y/h` 后硬判决。
 5. 无插值/均衡/跟踪：契约只有一个平坦复增益。
 6. CP=8 足够吸收定时小幅滑动；起点判决以残差为准，残差相同选最早位置。
+7. **多帧扫描**：候选独立评估（频偏/前导残差/导频残差/完整性）后再做全局
+   选择。导频残差用已知导频值 ±1 的拟合偏差，能识别“前导相关很好但导频
+   内容错误”的假峰。选择为区间 DP（加权区间调度），目标键为
+   （帧数降序， 残差总和升序， 起点序列字典序升序）；候选区间等长（112），
+   用二分找首个不冲突候选，复杂度 O(M log M)，M 为候选数。
 
 ## 浮点误差口径（明确，不用宽容差掩盖边界错误）
 
@@ -138,10 +189,22 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 * 无窗口/加权相关；强带内干扰下门限（0.85/0.35）可能需要调用方按场景调整。
 * 朴素 O(N²) DFT（N 固定 32），未做 FFT 优化——本题规模无此必要。
 * 不做 AGC、不输出软信息；DC 与空载波不参与判决。
+* 导频检验基于“单一复增益拟合四个导频观测”的偏差：若假峰的导频偏差
+  恰好能被一个复增益完全吸收（两导频载波保持已知 ±1 的相对模式），则与
+  合法帧物理上不可区分，不在本契约拒绝范围内。
+* 多帧扫描假定帧间不互相叠加（缓冲区为顺序拼接的帧与噪声）；物理上重叠
+  的帧不在契约内。
 
 ## demo 说明
 
-`python demo.py` 用确定性独立合成器生成一帧（真实时偏 23、频偏 +0.137、
-复增益 `1.7·exp(j0.6)`、固定种子噪声 0.05、帧尾噪声），实时打印恢复的
-起点、频偏、残差、增益与 48 位位串；然后构造一个前导可定位但在第二符号内
-截断的坏帧，实际抛出 `TruncatedFrameError`。无 sleep、无预录结果。
+`python demo.py` 分三部分，全部实时计算、无 sleep、无预录结果：
+
+1. **单帧正常恢复**：确定性独立合成器生成一帧（真实时偏 23、频偏 +0.137、
+   复增益 `1.7·exp(j0.6)`、固定种子噪声 0.05、帧尾噪声），打印恢复的起点、
+   频偏、残差、增益与 48 位位串。
+2. **单帧拒绝边界**：前导可定位但在第二符号内截断的坏帧，实际抛出
+   `TruncatedFrameError`。
+3. **多帧扫描**：402 样本缓冲区内放两个频偏不同（+0.11 / −0.23）的相邻帧
+   （起点 20 与 132，背靠背）和一个前导形似但导频错误的假峰（起点 260），
+   `scan_frames` 一次扫出两帧并打印各自频偏与位串核对结果、假峰及其旁瓣的
+   拒绝原因（`pilot_residual`）。

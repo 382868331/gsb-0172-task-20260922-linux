@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import bisect
 import cmath
 import math
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ PILOT_VALUES = {7: 1 + 0j, 25: -1 + 0j}
 
 DEFAULT_RHO_THRESHOLD = 0.85
 DEFAULT_RESIDUAL_THRESHOLD = 0.35
+DEFAULT_PILOT_RESIDUAL_THRESHOLD = 0.35
 # 信号上限 512 时可行起点最多 512-32+1=481，默认预算不会在接口上限处耗尽。
 DEFAULT_MAX_CANDIDATES = 1024
 
@@ -331,10 +333,36 @@ def decode(
             "samples"
         )
 
+    gain, symbols, _pilot_residual = _analyze_frame(
+        sig, best.start, best.frequency_offset
+    )
+
+    return DecodeResult(
+        start=best.start,
+        frequency_offset=best.frequency_offset,
+        residual=best.residual,
+        gain=gain,
+        symbols=symbols,
+        bits=symbols_to_bits(symbols),
+    )
+
+
+# ---------------------------------------------------------------- 单帧分析（共享）
+
+
+def _analyze_frame(sig, start: int, f_offset: float):
+    """对已知起点/频偏的完整帧做补偿、去 CP、DFT、导频增益与 QPSK 判决。
+
+    调用方须保证 ``start + FRAME_LEN <= len(sig)``。
+    返回 ``(gain, symbols, pilot_residual)``；导频能量不足抛
+    ``ZeroPilotEnergyError``。``pilot_residual`` 为导频观测相对最小二乘
+    拟合的归一化均方根误差 ``sqrt(Σ|Y−h·p|² / Σ|Y|²)``（4 个导频观测），
+    干净帧为 0，导频内容错误的假峰会显著大于 0。
+    """
     # 全帧频偏补偿（时间原点取帧起点；绝对相位被导频增益吸收）。
-    omega = -2.0 * math.pi * best.frequency_offset / N_FFT
+    omega = -2.0 * math.pi * f_offset / N_FFT
     seg = [
-        sig[best.start + n] * cmath.exp(1j * omega * n)
+        sig[start + n] * cmath.exp(1j * omega * n)
         for n in range(FRAME_LEN)
     ]
 
@@ -366,17 +394,229 @@ def decode(
         )
     gain = num / den
 
+    # 导频残差：导频观测与最小二乘拟合 h·p 的归一化偏差。
+    err = 0.0
+    for yk in spectra:
+        for k, p in PILOT_VALUES.items():
+            diff = yk[k] - gain * p
+            err += diff.real * diff.real + diff.imag * diff.imag
+    pilot_residual = math.sqrt(err / pilot_energy)
+
     symbols: list[complex] = []
     for yk in spectra:
         for kc in SIGNED_DATA_CARRIERS:
             k = kc % N_FFT
             symbols.append(_slice_qpsk(yk[k] / gain))
 
-    return DecodeResult(
-        start=best.start,
-        frequency_offset=best.frequency_offset,
-        residual=best.residual,
-        gain=gain,
-        symbols=symbols,
-        bits=symbols_to_bits(symbols),
+    return gain, symbols, pilot_residual
+
+
+# ---------------------------------------------------------------- 多帧扫描
+
+
+#: 拒绝原因代码（FrameRejection.reason 的取值）。
+REASON_PREAMBLE_RESIDUAL = "preamble_residual"
+REASON_FREQUENCY_OFFSET = "frequency_offset"
+REASON_ZERO_PILOT_ENERGY = "zero_pilot_energy"
+REASON_PILOT_RESIDUAL = "pilot_residual"
+
+
+@dataclass(frozen=True)
+class EvaluatedCandidate:
+    """通过全部质量门限、进入选择池的完整候选。
+
+    Attributes:
+        start: 前导第一个样本的下标。
+        frequency_offset: 该候选独立的频偏估计（载波间隔为单位）。
+        residual: 前导补偿残差，[0, 1]。
+        pilot_residual: 导频观测相对最小二乘拟合的归一化误差，干净帧为 0。
+    """
+
+    start: int
+    frequency_offset: float
+    residual: float
+    pilot_residual: float
+
+
+@dataclass(frozen=True)
+class FrameRejection:
+    """一个被拒绝的候选及其原因。
+
+    Attributes:
+        start: 候选起点下标。
+        reason: 机器可读原因代码（``REASON_*`` 常量之一）。
+        detail: 面向人的具体说明（含数值）。
+    """
+
+    start: int
+    reason: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class TruncatedFrame:
+    """前导可定位、但缓冲区在帧结束前截断的尾部不完整帧。
+
+    只另列说明，绝不补零当完整帧解码。
+
+    Attributes:
+        start: 前导起点下标。
+        available: 从起点起缓冲区实际可用的样本数。
+        needed: 完整帧所需样本数（FRAME_LEN）。
+    """
+
+    start: int
+    available: int
+    needed: int
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    """多帧扫描结果。
+
+    Attributes:
+        frames: 选中的互不重叠帧的解码结果（``DecodeResult``），按起点升序。
+        pool: 通过全部质量门限的候选（选择前），按起点升序。
+        rejected: 被质量门限拒绝的候选及原因，按起点升序。
+        truncated: 尾部不完整帧（未解码、未补零），按起点升序。
+    """
+
+    frames: tuple[DecodeResult, ...]
+    pool: tuple[EvaluatedCandidate, ...]
+    rejected: tuple[FrameRejection, ...]
+    truncated: tuple[TruncatedFrame, ...]
+
+
+def _selection_better(a, b) -> bool:
+    """选择键比较：a 严格优于 b 时返回 True。
+
+    键为 (完整帧数, 前导残差总和, 起点序列)：帧数多者优；并列时残差总和
+    小者优；再并列时起点序列字典序小者优。
+    """
+    if a[0] != b[0]:
+        return a[0] > b[0]
+    if a[1] != b[1]:
+        return a[1] < b[1]
+    return a[2] < b[2]
+
+
+def _select_non_overlapping(pool) -> list[EvaluatedCandidate]:
+    """区间动态规划：从候选池选出互不重叠的最优子集。
+
+    候选区间均为 [start, start+FRAME_LEN)。按起点排序后做后缀 DP：
+    ``best[i] = max(跳过 i, 选 i + best[首个不冲突候选])``，比较键见
+    ``_selection_better``。不会因为看见第一个相关峰就跳过后面整段。
+    """
+    ordered = sorted(pool, key=lambda c: c.start)
+    n = len(ordered)
+    starts = [c.start for c in ordered]
+    best: list[tuple[int, float, tuple[int, ...]]] = [(0, 0.0, ())] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        nxt = bisect.bisect_left(starts, ordered[i].start + FRAME_LEN, i + 1)
+        rest = best[nxt]
+        take = (
+            rest[0] + 1,
+            rest[1] + ordered[i].residual,
+            (ordered[i].start,) + rest[2],
+        )
+        skip = best[i + 1]
+        best[i] = take if _selection_better(take, skip) else skip
+    chosen = set(best[0][2])
+    return [c for c in ordered if c.start in chosen]
+
+
+def scan_frames(
+    signal,
+    *,
+    rho_threshold: float = DEFAULT_RHO_THRESHOLD,
+    residual_threshold: float = DEFAULT_RESIDUAL_THRESHOLD,
+    pilot_threshold: float = DEFAULT_PILOT_RESIDUAL_THRESHOLD,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+) -> ScanResult:
+    """在有限缓冲区（<=512 样本）内一次扫描并恢复多帧。
+
+    流程：按既有前导相关与固定帧长枚举全部候选；对每个候选**独立**求
+    频偏、前导残差、导频残差与完整性；质量门限（前导残差、频偏范围、
+    导频能量、导频残差）拒绝不合格候选并记录原因；尾部不完整帧另列；
+    最后用区间动态规划选出互不重叠的最优帧组（完整帧数最多，其次前导
+    残差总和最小，再起点序列字典序最小）。
+
+    缓冲区内没有任何候选时返回全空的 ``ScanResult``（扫描是批量操作，
+    空结果不是错误）；输入非法仍抛 ``SignalFormatError``/``ParameterError``，
+    搜索预算耗尽仍抛 ``SearchBudgetError``。
+    """
+    sig = _validate_signal(signal)
+    res_thr = _validate_threshold(residual_threshold, "residual_threshold")
+    pil_thr = _validate_threshold(pilot_threshold, "pilot_threshold")
+    # find_candidates 内部校验 rho_threshold 与 max_candidates。
+    candidates = find_candidates(
+        sig, rho_threshold=rho_threshold, max_candidates=max_candidates
+    )
+
+    pool: list[EvaluatedCandidate] = []
+    rejected: list[FrameRejection] = []
+    truncated: list[TruncatedFrame] = []
+    decoded: dict[int, tuple[complex, list[complex], float]] = {}
+
+    for cand in sorted(candidates, key=lambda c: c.start):
+        if cand.residual > res_thr:
+            rejected.append(FrameRejection(
+                cand.start,
+                REASON_PREAMBLE_RESIDUAL,
+                f"preamble residual {cand.residual:.6f} > "
+                f"residual_threshold={res_thr}",
+            ))
+            continue
+        if abs(cand.frequency_offset) >= CFO_LIMIT:
+            rejected.append(FrameRejection(
+                cand.start,
+                REASON_FREQUENCY_OFFSET,
+                f"estimated CFO {cand.frequency_offset:.6f} carrier "
+                f"spacings; contract requires |f| < {CFO_LIMIT}",
+            ))
+            continue
+        available = len(sig) - cand.start
+        if available < FRAME_LEN:
+            truncated.append(TruncatedFrame(cand.start, available, FRAME_LEN))
+            continue
+        try:
+            gain, symbols, pilot_residual = _analyze_frame(
+                sig, cand.start, cand.frequency_offset
+            )
+        except ZeroPilotEnergyError as exc:
+            rejected.append(FrameRejection(
+                cand.start, REASON_ZERO_PILOT_ENERGY, str(exc)
+            ))
+            continue
+        if pilot_residual > pil_thr:
+            rejected.append(FrameRejection(
+                cand.start,
+                REASON_PILOT_RESIDUAL,
+                f"pilot residual {pilot_residual:.6f} > "
+                f"pilot_threshold={pil_thr} (preamble-like but pilots "
+                "do not match the known +/-7 values)",
+            ))
+            continue
+        decoded[cand.start] = (gain, symbols, pilot_residual)
+        pool.append(EvaluatedCandidate(
+            cand.start, cand.frequency_offset, cand.residual, pilot_residual
+        ))
+
+    frames: list[DecodeResult] = []
+    for ev in _select_non_overlapping(pool):
+        gain, symbols, _pr = decoded[ev.start]
+        frames.append(DecodeResult(
+            start=ev.start,
+            frequency_offset=ev.frequency_offset,
+            residual=ev.residual,
+            gain=gain,
+            symbols=symbols,
+            bits=symbols_to_bits(symbols),
+        ))
+
+    return ScanResult(
+        frames=tuple(frames),
+        pool=tuple(pool),
+        rejected=tuple(rejected),
+        truncated=tuple(truncated),
     )
