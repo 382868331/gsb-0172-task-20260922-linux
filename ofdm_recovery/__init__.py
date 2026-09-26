@@ -1,4 +1,4 @@
-"""可导入的本题库：OFDM 循环前缀边界与子载波恢复。"""
+"""可导入的本题库：OFDM 循环前缀边界与子载波恢复（含软解调）。"""
 
 from .core import (
     BLOCK_LEN,
@@ -22,14 +22,20 @@ from .core import (
     PILOT_VALUES,
     ParameterError,
     PREAMBLE_LEN,
+    QAM16_GRAY,
+    QPSK_GRAY,
     SearchBudgetError,
     SignalFormatError,
     SIGNED_DATA_CARRIERS,
+    SoftDecodeResult,
     TruncatedFrameError,
     ZeroPilotEnergyError,
     decode,
+    decode_soft,
     dft,
     find_candidates,
+    soft_demod,
+    soft_demod_equalized,
     symbols_to_bits,
 )
 
@@ -55,13 +61,20 @@ __all__ = [
     "PILOT_VALUES",
     "ParameterError",
     "PREAMBLE_LEN",
+    "QAM16_GRAY",
+    "QPSK_GRAY",
     "SearchBudgetError",
     "SignalFormatError",
     "SIGNED_DATA_CARRIERS",
+    "SoftDecodeResult",
     "TruncatedFrameError",
     "ZeroPilotEnergyError",
     "decode",
+    "decode_soft",
     "dft",
     "find_candidates",
+    "soft_demod",
+    "soft_demod_equalized",
     "symbols_to_bits",
 ]
+

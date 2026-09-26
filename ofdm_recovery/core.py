@@ -46,6 +46,39 @@ CFO_LIMIT = 0.5  # 合法频偏估计区间 |f| < 0.5 个载波间隔
 _PILOT_REL_FLOOR = 1e-9
 _QPSK = 1.0 / math.sqrt(2.0)
 
+# ---------------------------------------------------------------- 星座 Gray 表
+#
+# 显式 Gray 映射表（题内约定，不声称兼容任何行业标准）：
+# * QPSK：每符号 2 位 (b0, b1)，b0 对应实部、b1 对应虚部，位 0 -> 正坐标。
+# * 16QAM：每符号 4 位 (b0, b1, b2, b3)，(b0, b1) 映射实部、(b2, b3) 映射
+#   虚部，每轴 2 位按 Gray 00->+3, 01->+1, 11->-1, 10->-3，电平除以 sqrt(10)
+#   使平均能量为 1。
+
+QPSK_GRAY = (
+    ((0, 0), complex(_QPSK, _QPSK)),
+    ((0, 1), complex(_QPSK, -_QPSK)),
+    ((1, 1), complex(-_QPSK, -_QPSK)),
+    ((1, 0), complex(-_QPSK, _QPSK)),
+)
+
+_QAM16_AXIS_GRAY = (
+    ((0, 0), 3.0),
+    ((0, 1), 1.0),
+    ((1, 1), -1.0),
+    ((1, 0), -3.0),
+)
+_QAM16_NORM = 1.0 / math.sqrt(10.0)
+QAM16_GRAY = tuple(
+    (
+        (b0, b1, b2, b3),
+        complex(re_level, im_level) * _QAM16_NORM,
+    )
+    for (b0, b1), re_level in _QAM16_AXIS_GRAY
+    for (b2, b3), im_level in _QAM16_AXIS_GRAY
+)
+
+_CONSTELLATIONS = {"qpsk": QPSK_GRAY, "qam16": QAM16_GRAY}
+
 
 # ---------------------------------------------------------------- 错误语义
 
@@ -262,6 +295,91 @@ def symbols_to_bits(symbols) -> str:
         out.append("0" if s.imag >= 0.0 else "1")
     return "".join(out)
 
+# ---------------------------------------------------------------- 软解调
+
+
+def _validate_noise_var(value) -> float:
+    """复噪声方差：必须是正的有限实数（拒绝 bool/0/负/NaN/Inf）。"""
+    _reject_bool(value, "noise_var")
+    if not isinstance(value, (int, float)):
+        raise ParameterError("noise_var must be a real number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ParameterError(f"noise_var must be finite, got {value}")
+    if value <= 0.0:
+        raise ParameterError(f"noise_var must be positive, got {value}")
+    return value
+
+
+def _constellation(modulation) -> tuple:
+    if isinstance(modulation, bool) or not isinstance(modulation, str):
+        raise ParameterError("modulation must be 'qpsk' or 'qam16'")
+    key = modulation.lower()
+    if key not in _CONSTELLATIONS:
+        raise ParameterError(
+            f"unknown modulation {modulation!r}; expected 'qpsk' or 'qam16'"
+        )
+    return _CONSTELLATIONS[key]
+
+
+def _log_sum_exp(values) -> float:
+    """数值稳定的 log(Σ exp(v))，用 math.fsum 做高精度求和。"""
+    vals = list(values)
+    m = max(vals)
+    return m + math.log(math.fsum(math.exp(v - m) for v in vals))
+
+
+def soft_demod(symbol, noise_var, *, modulation: str = "qpsk") -> list[float]:
+    """对单个已均衡符号做软解调，返回每位的对数似然比（LLR）。
+
+    LLR 约定为 log P(bit=0 | y) - log P(bit=1 | y)，**正值偏向位 0**。
+    两组星座点概率用 log-sum-exp 计算：
+    LLR_i = lse_{s: b_i=0}(-|y-s|²/σ²) - lse_{s: b_i=1}(-|y-s|²/σ²)，
+    其中 σ² = noise_var 为复噪声方差（必须为正）。
+    位序与星座表一致：QPSK 2 位（先实部后虚部），16QAM 4 位。
+    """
+    table = _constellation(modulation)
+    sigma2 = _validate_noise_var(noise_var)
+    y = _finite_complex(symbol, "symbol")
+    loglik = [
+        -((y.real - s.real) ** 2 + (y.imag - s.imag) ** 2) / sigma2
+        for _, s in table
+    ]
+    nbits = len(table[0][0])
+    llrs = []
+    for i in range(nbits):
+        l0 = _log_sum_exp(
+            ll for (bits, _), ll in zip(table, loglik) if bits[i] == 0
+        )
+        l1 = _log_sum_exp(
+            ll for (bits, _), ll in zip(table, loglik) if bits[i] == 1
+        )
+        llrs.append(l0 - l1)
+    return llrs
+
+
+def soft_demod_equalized(
+    symbol, gain, noise_var, *, modulation: str = "qpsk"
+) -> tuple[list[float], bool]:
+    """带信道增益的软解调：返回 (llrs, erased)。
+
+    先用 gain 均衡符号，噪声方差按增益同步调整为
+    noise_var / |gain|²（深衰落时等效噪声放大，LLR 自然趋近 0）。
+    gain == 0 视为**擦除**：返回全 0 LLR 且 erased=True，
+    不做硬判成全 0 位。
+    """
+    table = _constellation(modulation)
+    sigma2 = _validate_noise_var(noise_var)
+    g = _finite_complex(gain, "gain")
+    y = _finite_complex(symbol, "symbol")
+    nbits = len(table[0][0])
+    if g == 0j:
+        return [0.0] * nbits, True
+    eq = y / g
+    return soft_demod(eq, sigma2 / (g.real * g.real + g.imag * g.imag),
+                      modulation=modulation), False
+
+
 
 # ---------------------------------------------------------------- 主解码入口
 
@@ -296,6 +414,35 @@ def decode(
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
 ) -> DecodeResult:
     """离线恢复一帧。失败时抛出 ``OFDMError`` 的具体子类，不返回半结果。"""
+    best, gain, eq_symbols = _recover_frame(
+        signal,
+        rho_threshold=rho_threshold,
+        residual_threshold=residual_threshold,
+        max_candidates=max_candidates,
+    )
+    symbols = [_slice_qpsk(v) for v in eq_symbols]
+    return DecodeResult(
+        start=best.start,
+        frequency_offset=best.frequency_offset,
+        residual=best.residual,
+        gain=gain,
+        symbols=symbols,
+        bits=symbols_to_bits(symbols),
+    )
+
+
+def _recover_frame(
+    signal,
+    *,
+    rho_threshold: float,
+    residual_threshold: float,
+    max_candidates: int,
+):
+    """共享接收管线：定位、补偿、DFT、信道估计，返回
+    ``(best_candidate, gain, 均衡后的 24 个数据载波观测)``。
+
+    只保留数据载波（±1..±6）；导频、DC 与保护带不进入符号序列。
+    """
     sig = _validate_signal(signal)
     res_thr = _validate_threshold(residual_threshold, "residual_threshold")
     # find_candidates 内部会校验其余参数与信号。
@@ -366,17 +513,90 @@ def decode(
         )
     gain = num / den
 
-    symbols: list[complex] = []
+    eq_symbols: list[complex] = []
     for yk in spectra:
         for kc in SIGNED_DATA_CARRIERS:
             k = kc % N_FFT
-            symbols.append(_slice_qpsk(yk[k] / gain))
+            eq_symbols.append(yk[k] / gain)
 
-    return DecodeResult(
+    return best, gain, eq_symbols
+
+
+# ---------------------------------------------------------------- 软解调帧入口
+
+
+@dataclass(frozen=True)
+class SoftDecodeResult:
+    """软解调结果（硬判决字段与 ``DecodeResult`` 完全同序，保持原位序）。
+
+    Attributes:
+        start / frequency_offset / residual / gain / symbols / bits:
+            与 ``DecodeResult`` 相同的硬判决输出。
+        modulation: 使用的星座（'qpsk' 或 'qam16'）。
+        noise_var: 调用方给定的复噪声方差（正数）。
+        llrs: 展平的每位 LLR（正值偏向位 0），QPSK 48 个、16QAM 96 个，
+            顺序与 ``bits`` 的数据位序列一致（只含数据载波，
+            导频/DC/保护带不混入）。
+        erasures: 24 个布尔，标记对应符号是否为零增益擦除
+            （擦除位的 LLR 恒为 0.0，不硬判成全 0）。
+    """
+
+    start: int
+    frequency_offset: float
+    residual: float
+    gain: complex
+    symbols: list[complex]
+    bits: str
+    modulation: str
+    noise_var: float
+    llrs: list[float]
+    erasures: list[bool]
+
+
+def decode_soft(
+    signal,
+    noise_var,
+    *,
+    modulation: str = "qpsk",
+    rho_threshold: float = DEFAULT_RHO_THRESHOLD,
+    residual_threshold: float = DEFAULT_RESIDUAL_THRESHOLD,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+) -> SoftDecodeResult:
+    """在原符号恢复管线之后追加软解调，返回每位 LLR 与擦除标志。
+
+    信道补偿后的噪声方差按增益同步调整为 ``noise_var / |gain|²``；
+    增益为零的载波按擦除处理（LLR=0 且置擦除标志）。
+    """
+    table = _constellation(modulation)
+    sigma2 = _validate_noise_var(noise_var)
+    best, gain, eq_symbols = _recover_frame(
+        signal,
+        rho_threshold=rho_threshold,
+        residual_threshold=residual_threshold,
+        max_candidates=max_candidates,
+    )
+    symbols = [_slice_qpsk(v) for v in eq_symbols]
+    llrs: list[float] = []
+    erasures: list[bool] = []
+    for v in eq_symbols:
+        # 与 soft_demod_equalized 同一定义：零增益 -> 擦除。
+        if gain == 0j:  # 防御性：正常流程零增益已在导频检查处拒绝
+            llrs.extend([0.0] * len(table[0][0]))
+            erasures.append(True)
+            continue
+        llrs.extend(
+            soft_demod(v, sigma2 / (abs(gain) ** 2), modulation=modulation)
+        )
+        erasures.append(False)
+    return SoftDecodeResult(
         start=best.start,
         frequency_offset=best.frequency_offset,
         residual=best.residual,
         gain=gain,
         symbols=symbols,
         bits=symbols_to_bits(symbols),
+        modulation=modulation.lower(),
+        noise_var=sigma2,
+        llrs=llrs,
+        erasures=erasures,
     )
