@@ -278,6 +278,9 @@ class DecodeResult:
         symbols: 24 个 QPSK 判决符号，顺序为符号 0→1，
             每符号载波 -6..-1、+1..+6；取值 ±(1±j)/√2。
         bits: 48 位恢复位串（每符号 2 位，先实部后虚部，正为 0）。
+        llrs: 调用方提供 noise_variance 时，48 个数据比特的软解调 LLR
+            （正值偏向比特 0，位序与 bits 一致）；否则为 None。
+        erasures: 与 llrs 对应的 24 个数据符号擦除标志；未软解调时为 None。
     """
 
     start: int
@@ -286,6 +289,8 @@ class DecodeResult:
     gain: complex
     symbols: list[complex]
     bits: str
+    llrs: tuple | None = None
+    erasures: tuple | None = None
 
 
 def decode(
@@ -294,10 +299,19 @@ def decode(
     rho_threshold: float = DEFAULT_RHO_THRESHOLD,
     residual_threshold: float = DEFAULT_RESIDUAL_THRESHOLD,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    noise_variance=None,
 ) -> DecodeResult:
-    """离线恢复一帧。失败时抛出 ``OFDMError`` 的具体子类，不返回半结果。"""
+    """离线恢复一帧。失败时抛出 ``OFDMError`` 的具体子类，不返回半结果。
+
+    给出正的复噪声方差 ``noise_variance`` 时，在硬判决之外对每个数据
+    比特追加 QPSK 软解调 LLR（正值偏向比特 0）；导频、DC 与保护带
+    不进入数据位序列。信道补偿后噪声方差按 σ²/|gain|² 同步调整；
+    增益为零时全部数据符号按擦除处理（LLR=0 并置擦除标志）。
+    """
     sig = _validate_signal(signal)
     res_thr = _validate_threshold(residual_threshold, "residual_threshold")
+    if noise_variance is not None:
+        noise_variance = _validate_noise_variance(noise_variance)
     # find_candidates 内部会校验其余参数与信号。
     candidates = find_candidates(
         sig, rho_threshold=rho_threshold, max_candidates=max_candidates
@@ -366,11 +380,23 @@ def decode(
         )
     gain = num / den
 
+    observations: list[complex] = []
     symbols: list[complex] = []
     for yk in spectra:
         for kc in SIGNED_DATA_CARRIERS:
             k = kc % N_FFT
+            observations.append(yk[k])
             symbols.append(_slice_qpsk(yk[k] / gain))
+
+    llrs = erasures = None
+    if noise_variance is not None:
+        soft = soft_demodulate(
+            observations,
+            modulation="qpsk",
+            noise_variance=noise_variance,
+            gains=[gain] * len(observations),
+        )
+        llrs, erasures = soft.llrs, soft.erasures
 
     return DecodeResult(
         start=best.start,
@@ -379,4 +405,168 @@ def decode(
         gain=gain,
         symbols=symbols,
         bits=symbols_to_bits(symbols),
+        llrs=llrs,
+        erasures=erasures,
     )
+
+# ---------------------------------------------------------------- 软解调
+
+# 题内显式 Gray 星座表：位组 -> 星座点。LLR 约定正值偏向比特 0。
+# QPSK：b0 对应实部、b1 对应虚部，正坐标 -> 0，负坐标 -> 1（与硬判决一致）。
+QPSK_GRAY = {
+    (0, 0): complex(_QPSK, _QPSK),
+    (0, 1): complex(_QPSK, -_QPSK),
+    (1, 0): complex(-_QPSK, _QPSK),
+    (1, 1): complex(-_QPSK, -_QPSK),
+}
+
+# 16QAM：电平 ±1、±3 按 1/√10 归一化；(b0,b1) 映射实部、(b2,b3) 映射虚部，
+# 沿每根轴为 Gray 序 00->-3, 01->-1, 11->+1, 10->+3。
+_QAM16_SCALE = 1.0 / math.sqrt(10.0)
+QAM16_GRAY = {
+    (0, 0, 0, 0): complex(-3, -3) * _QAM16_SCALE,
+    (0, 0, 0, 1): complex(-3, -1) * _QAM16_SCALE,
+    (0, 0, 1, 1): complex(-3, 1) * _QAM16_SCALE,
+    (0, 0, 1, 0): complex(-3, 3) * _QAM16_SCALE,
+    (0, 1, 0, 0): complex(-1, -3) * _QAM16_SCALE,
+    (0, 1, 0, 1): complex(-1, -1) * _QAM16_SCALE,
+    (0, 1, 1, 1): complex(-1, 1) * _QAM16_SCALE,
+    (0, 1, 1, 0): complex(-1, 3) * _QAM16_SCALE,
+    (1, 1, 0, 0): complex(1, -3) * _QAM16_SCALE,
+    (1, 1, 0, 1): complex(1, -1) * _QAM16_SCALE,
+    (1, 1, 1, 1): complex(1, 1) * _QAM16_SCALE,
+    (1, 1, 1, 0): complex(1, 3) * _QAM16_SCALE,
+    (1, 0, 0, 0): complex(3, -3) * _QAM16_SCALE,
+    (1, 0, 0, 1): complex(3, -1) * _QAM16_SCALE,
+    (1, 0, 1, 1): complex(3, 1) * _QAM16_SCALE,
+    (1, 0, 1, 0): complex(3, 3) * _QAM16_SCALE,
+}
+
+_CONSTELLATIONS = {"qpsk": QPSK_GRAY, "16qam": QAM16_GRAY}
+
+
+@dataclass(frozen=True)
+class SoftDemodResult:
+    """软解调结果。
+
+    Attributes:
+        modulation: "qpsk" 或 "16qam"。
+        llrs: 每个比特的对数似然比 log P(b=0)/P(b=1)，正值偏向比特 0；
+            被擦除的符号对应位恒为 0.0。
+        erasures: 每个符号是否被擦除（擦除符号的全部位 LLR 为 0）。
+    """
+
+    modulation: str
+    llrs: tuple
+    erasures: tuple
+
+
+def _validate_noise_variance(value) -> float:
+    _reject_bool(value, "noise_variance")
+    if not isinstance(value, (int, float)):
+        raise ParameterError("noise_variance must be a real number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ParameterError(f"noise_variance must be finite, got {value}")
+    if value <= 0.0:
+        raise ParameterError(
+            f"noise_variance must be positive, got {value}"
+        )
+    return value
+
+
+def _logsumexp(terms) -> float:
+    """稳定的 log(Σ exp(t))；terms 为空时返回 -inf。"""
+    peak = max(terms)
+    if peak == -math.inf:
+        return -math.inf
+    return peak + math.log(sum(math.exp(t - peak) for t in terms))
+
+
+def soft_demodulate(
+    symbols,
+    *,
+    modulation: str = "qpsk",
+    noise_variance,
+    gains=None,
+    erased=None,
+) -> SoftDemodResult:
+    """对星座观测序列做软解调，输出每比特 LLR（正值偏向比特 0）。
+
+    symbols: 复数观测序列（若给出 gains，则为信道补偿**前**的观测 y=h·s+n）。
+    modulation: "qpsk" 或 "16qam"，使用题内显式 Gray 表。
+    noise_variance: 正的复噪声方差 σ² = E|n|²（调用方提供）。
+    gains: 可选的每符号复增益序列；补偿后噪声方差按 σ²/|h|² 调整，
+        零增益符号按擦除处理。
+    erased: 可选的每符号布尔序列，True 表示该符号被擦除。
+
+    擦除符号的全部比特返回 LLR=0.0 并在 erasures 中置位，不做硬判。
+    每个比特用 log-sum-exp 分别累加两组星座点的对数概率。
+    """
+    if isinstance(modulation, bool) or not isinstance(modulation, str):
+        raise ParameterError("modulation must be the string 'qpsk' or '16qam'")
+    table = _CONSTELLATIONS.get(modulation.lower())
+    if table is None:
+        raise ParameterError(
+            f"unknown modulation {modulation!r}; expected 'qpsk' or '16qam'"
+        )
+    sigma2 = _validate_noise_variance(noise_variance)
+    if not isinstance(symbols, (list, tuple)):
+        raise SignalFormatError("symbols must be a list/tuple")
+    obs = [_finite_complex(v, f"symbols[{i}]") for i, v in enumerate(symbols)]
+    count = len(obs)
+
+    if gains is None:
+        gain_list = [None] * count
+    else:
+        if not isinstance(gains, (list, tuple)) or len(gains) != count:
+            raise ParameterError(
+                "gains must be a list/tuple with one complex gain per symbol"
+            )
+        gain_list = [
+            _finite_complex(g, f"gains[{i}]") for i, g in enumerate(gains)
+        ]
+
+    if erased is None:
+        erased_list = [False] * count
+    else:
+        if not isinstance(erased, (list, tuple)) or len(erased) != count:
+            raise ParameterError(
+                "erased must be a list/tuple with one bool per symbol"
+            )
+        erased_list = []
+        for i, e in enumerate(erased):
+            if not isinstance(e, bool):
+                raise ParameterError(f"erased[{i}] must be a bool")
+            erased_list.append(e)
+
+    bits_per_symbol = len(next(iter(table)))
+    by_bit = [([], []) for _ in range(bits_per_symbol)]
+    for bits, point in table.items():
+        for b in range(bits_per_symbol):
+            by_bit[b][bits[b]].append(point)
+
+    llrs: list[float] = []
+    erasures: list[bool] = []
+    for i, y in enumerate(obs):
+        h = gain_list[i]
+        if h is None:
+            z, var = y, sigma2
+        elif h == 0j:
+            z, var = None, None  # 零增益 -> 擦除
+        else:
+            z, var = y / h, sigma2 / (h.real * h.real + h.imag * h.imag)
+        is_erased = erased_list[i] or z is None
+        erasures.append(is_erased)
+        if is_erased:
+            llrs.extend([0.0] * bits_per_symbol)
+            continue
+        for b in range(bits_per_symbol):
+            zeros, ones = by_bit[b]
+            llr = _logsumexp(
+                [-((z - s).real ** 2 + (z - s).imag ** 2) / var for s in zeros]
+            ) - _logsumexp(
+                [-((z - s).real ** 2 + (z - s).imag ** 2) / var for s in ones]
+            )
+            llrs.append(llr)
+    return SoftDemodResult(modulation.lower(), tuple(llrs), tuple(erasures))
