@@ -46,6 +46,10 @@ CFO_LIMIT = 0.5  # 合法频偏估计区间 |f| < 0.5 个载波间隔
 _PILOT_REL_FLOOR = 1e-9
 _QPSK = 1.0 / math.sqrt(2.0)
 
+# 保留子载波（发射端 PAPR 压低）默认参数
+DEFAULT_TR_MAX_ITERATIONS = 128
+_TR_VERIFY_TOL = 1e-9
+
 
 # ---------------------------------------------------------------- 错误语义
 
@@ -84,6 +88,10 @@ class TruncatedFrameError(OFDMError):
 
 class ZeroPilotEnergyError(OFDMError):
     """导频载波能量为零（或低于相对底限），无法估计复增益。"""
+
+
+class ReservedCarrierError(OFDMError):
+    """保留子载波集合非法：为空、越界、重复，或与数据/导频/DC 重叠。"""
 
 
 # ---------------------------------------------------------------- 输入校验
@@ -379,4 +387,254 @@ def decode(
         gain=gain,
         symbols=symbols,
         bits=symbols_to_bits(symbols),
+    )
+
+
+# ---------------------------------------------------------------- 保留子载波 PAPR 压低（发射端）
+
+# 允许作为保留音调的 DFT 索引：除数据、导频、DC 外的全部载波（8..24）。
+FREE_CARRIERS = tuple(
+    k for k in range(N_FFT)
+    if k not in DATA_CARRIERS and k not in PILOT_CARRIERS and k != 0
+)
+
+
+def _idft(x) -> list[complex]:
+    """朴素 IDFT：x[n] = (1/N) * sum_k X[k] exp(+j2*pi*k*n/N)。"""
+    n = len(x)
+    return [
+        sum(
+            (x[k] * cmath.exp(2j * math.pi * k * m / n) for k in range(n)),
+            0j,
+        )
+        / n
+        for m in range(n)
+    ]
+
+
+def _papr_linear(x) -> float:
+    """线性峰均比 max|x|^2 / mean|x|^2。"""
+    powers = [v.real * v.real + v.imag * v.imag for v in x]
+    mean = sum(powers) / len(powers)
+    if mean <= 0.0:
+        return 1.0
+    return max(powers) / mean
+
+
+def _validate_reserved(reserved_carriers) -> tuple[int, ...]:
+    if not isinstance(reserved_carriers, (list, tuple)):
+        raise ReservedCarrierError(
+            "reserved_carriers must be a list/tuple of DFT indices, got "
+            f"{type(reserved_carriers).__name__}"
+        )
+    if len(reserved_carriers) == 0:
+        raise ReservedCarrierError(
+            "reserved_carriers is empty: no degrees of freedom exist for "
+            "peak reduction; provide at least one free carrier in 8..24"
+        )
+    seen: set[int] = set()
+    out: list[int] = []
+    protected = set(DATA_CARRIERS) | set(PILOT_CARRIERS) | {0}
+    for i, k in enumerate(reserved_carriers):
+        if isinstance(k, bool) or not isinstance(k, int):
+            raise ReservedCarrierError(
+                f"reserved_carriers[{i}]={k!r} is not an int DFT index"
+            )
+        if not 0 <= k < N_FFT:
+            raise ReservedCarrierError(
+                f"reserved_carriers[{i}]={k} out of range 0..{N_FFT - 1}"
+            )
+        if k in protected:
+            if k == 0:
+                role = "DC"
+            elif k in PILOT_CARRIERS:
+                role = "pilot"
+            else:
+                role = "data"
+            raise ReservedCarrierError(
+                f"reserved_carriers[{i}]={k} overlaps the {role} carrier "
+                "layout; reserved tones must leave data, pilots and DC "
+                "untouched"
+            )
+        if k in seen:
+            raise ReservedCarrierError(
+                f"reserved_carriers[{i}]={k} is duplicated"
+            )
+        seen.add(k)
+        out.append(k)
+    return tuple(out)
+
+
+def _validate_data_symbols(data_symbols) -> list[complex]:
+    if not isinstance(data_symbols, (list, tuple)):
+        raise SignalFormatError("data_symbols must be a list/tuple")
+    if len(data_symbols) != len(SIGNED_DATA_CARRIERS):
+        raise SignalFormatError(
+            f"data_symbols must hold exactly {len(SIGNED_DATA_CARRIERS)} "
+            f"QPSK symbols for one OFDM symbol, got {len(data_symbols)}"
+        )
+    return [
+        _finite_complex(v, f"data_symbols[{i}]")
+        for i, v in enumerate(data_symbols)
+    ]
+
+
+def _validate_nonnegative(value, name: str) -> float:
+    _reject_bool(value, name)
+    if not isinstance(value, (int, float)):
+        raise ParameterError(f"{name} must be a real number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ParameterError(f"{name} must be finite, got {value}")
+    if value < 0.0:
+        raise ParameterError(f"{name} must be >= 0, got {value}")
+    return value
+
+
+@dataclass(frozen=True)
+class ToneReservationResult:
+    """保留子载波迭代投影的结果。
+
+    Attributes:
+        time_signal: 压低后的 32 点时域 OFDM 符号（不含 CP），未做时域裁剪。
+        spectrum: 最终 32 点频域；数据/导频/DC 频点与输入完全一致，
+            只有保留频点被调整。
+        reserved_carriers: 实际使用的保留频点（升序）。
+        papr_history: 每轮（含初始第 0 轮）的线性峰均比。
+        reserved_energy_history: 每轮保留音调总能量 sum|X[k]|^2。
+        reserved_energy: 最终保留音调总能量，保证 <= max_reserved_energy。
+        target_papr: 目标线性峰均比。
+        achieved: 最终峰均比是否达到目标；达不到时为 False，只如实报告，
+            不承诺每组数据都有足够自由度。
+        iterations: 实际执行的投影轮数。
+    """
+
+    time_signal: list[complex]
+    spectrum: list[complex]
+    reserved_carriers: tuple[int, ...]
+    papr_history: tuple[float, ...]
+    reserved_energy_history: tuple[float, ...]
+    reserved_energy: float
+    target_papr: float
+    achieved: bool
+    iterations: int
+
+
+def reduce_papr_tone_reservation(
+    data_symbols,
+    reserved_carriers,
+    *,
+    target_papr_db: float,
+    max_reserved_energy: float,
+    max_iterations: int = DEFAULT_TR_MAX_ITERATIONS,
+) -> ToneReservationResult:
+    """只调整保留子载波的复值，用迭代投影压低一个 OFDM 符号的时域峰值。
+
+    流程：构造频域（数据载波取 data_symbols，导频取已知 +/-1，DC 与其余
+    为 0，保留频点初始为 0），IDFT 后对超过目标幅度的样本计算时域修正量，
+    修正量只投影到保留频点；保留音调总能量超预算时整体等比缩回预算内；
+    重复直到峰均比达标或 max_iterations 轮耗尽。
+
+    停止后重新对时域做 DFT，逐一核对数据/导频/DC 频点与输入完全一致
+    （容差 1e-9），绝不通过直接裁剪时域波形来破坏载荷。达不到目标时
+    achieved=False，如实返回最终峰均比与实际能量。
+
+    max_reserved_energy=0 合法：保留音调被强制为 0，峰均比不会改善，
+    结果如实报告未达标。
+    """
+    symbols = _validate_data_symbols(data_symbols)
+    reserved = _validate_reserved(reserved_carriers)
+    target_db = _validate_nonnegative(target_papr_db, "target_papr_db")
+    if target_db <= 0.0:
+        raise ParameterError(f"target_papr_db must be > 0, got {target_db}")
+    budget = _validate_nonnegative(max_reserved_energy, "max_reserved_energy")
+    if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
+        raise ParameterError("max_iterations must be an int, not bool/float")
+    if max_iterations < 1:
+        raise ParameterError("max_iterations must be >= 1")
+
+    target = 10.0 ** (target_db / 10.0)
+    # 迭代在削峰阈值附近渐近收敛；阈值比目标内缩 0.1%，
+    # 使有限轮数内最终结果稳定落到目标之下。
+    aim = target * (1.0 - 1e-3)
+    target_tol = target * (1.0 + 1e-6)
+
+    # 构造初始频域：数据/导频/DC 固定，保留频点为 0。
+    spectrum = [0j] * N_FFT
+    for j, kc in enumerate(SIGNED_DATA_CARRIERS):
+        spectrum[kc % N_FFT] = symbols[j]
+    for k, p in PILOT_VALUES.items():
+        spectrum[k] = p
+    original = list(spectrum)
+
+    time_signal = _idft(spectrum)
+    papr_history: list[float] = [_papr_linear(time_signal)]
+    energy_history: list[float] = [0.0]
+
+    iterations = 0
+    while papr_history[-1] > aim and iterations < max_iterations:
+        mean_power = sum(
+            v.real * v.real + v.imag * v.imag for v in time_signal
+        ) / N_FFT
+        clip_amp = math.sqrt(aim * mean_power)
+        # 需要削掉的时域修正量（不直接应用到波形，只用于求频域投影）。
+        correction = [
+            v - clip_amp * v / abs(v) if abs(v) > clip_amp else 0j
+            for v in time_signal
+        ]
+        delta = dft(correction)  # 无归一化 DFT
+        # 只把修正投影到保留频点：x -= correction 对应 X[k] -= delta[k]。
+        new_reserved = {k: spectrum[k] - delta[k] for k in reserved}
+        energy = sum(
+            v.real * v.real + v.imag * v.imag for v in new_reserved.values()
+        )
+        if energy > budget:
+            if budget <= 0.0:
+                new_reserved = {k: 0j for k in reserved}
+            else:
+                scale = math.sqrt(budget / energy)
+                new_reserved = {k: v * scale for k, v in new_reserved.items()}
+            energy = sum(
+                v.real * v.real + v.imag * v.imag
+                for v in new_reserved.values()
+            )
+        for k, v in new_reserved.items():
+            spectrum[k] = v
+        time_signal = _idft(spectrum)
+        papr_history.append(_papr_linear(time_signal))
+        energy_history.append(energy)
+        iterations += 1
+
+    # 停止后强制复核：重新 DFT，确认数据/导频/DC 频点未被破坏，
+    # 保留音调能量未超预算。不满足即视为内部错误，不静默放行。
+    check = dft(time_signal)
+    reserved_set = set(reserved)
+    for k in range(N_FFT):
+        if k in reserved_set:
+            continue
+        if abs(check[k] - original[k]) > _TR_VERIFY_TOL * max(
+            1.0, abs(original[k])
+        ):
+            raise OFDMError(
+                f"internal verification failed: carrier {k} changed from "
+                f"{original[k]} to {check[k]}; refusing to return a "
+                "spectrum that corrupts the payload"
+            )
+    final_energy = energy_history[-1]
+    if final_energy > budget * (1.0 + _TR_VERIFY_TOL):
+        raise OFDMError(
+            f"internal verification failed: reserved energy {final_energy} "
+            f"exceeds budget {budget}"
+        )
+
+    return ToneReservationResult(
+        time_signal=time_signal,
+        spectrum=list(spectrum),
+        reserved_carriers=tuple(sorted(reserved)),
+        papr_history=tuple(papr_history),
+        reserved_energy_history=tuple(energy_history),
+        reserved_energy=final_energy,
+        target_papr=target,
+        achieved=papr_history[-1] <= target_tol,
+        iterations=iterations,
     )

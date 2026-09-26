@@ -14,21 +14,35 @@ N=32 / CP=8 的合成帧，估计载波频偏并补偿，去循环前缀后自�
 * 核心算法（相关、频偏估计、DFT/IDFT、导频最小二乘、QPSK 判决）全部在
   `ofdm_recovery/core.py` 内手写，没有用第三方同类实现代替。
 
+### 准备虚拟环境（可选，非必须）
+
+仓库不强制虚拟环境；若希望隔离解释器，按常规方式准备即可：
+
+```bash
+python3.14 -m venv .venv        # 或任何指向 3.14.7 的解释器
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+无第三方依赖，`requirements.txt` 为空占位，不需要 `pip install`。
+
 ## 运行命令
 
 ```bash
 python -m unittest discover -s tests -v   # 必要测试，约 0.05 s
 python demo.py                            # 固定输入演示，实测 < 0.1 s（远低于约 8 s 预算）
+python demo_iteration.py                  # 保留子载波 PAPR 压低演示，实测 < 1 s（预算 90 s）
 ```
 
 ## 仓库结构
 
 ```
 ofdm_recovery/__init__.py   公开接口导出
-ofdm_recovery/core.py       核心库（DFT、候选搜索、解码、错误类型）
+ofdm_recovery/core.py       核心库（DFT、候选搜索、解码、保留子载波压低、错误类型）
 tests/reference.py          独立直接合成器（不导入被测核心；期望值的唯一来源）
-tests/test_ofdm.py          必要测试（24 个）
+tests/test_ofdm.py          接收链路必要测试（24 个）
+tests/test_tone_reservation.py  保留子载波测试（11 个，自带独立 DFT 复核）
 demo.py                     固定输入 demo：1 个正常恢复 + 1 个实际触发的拒绝
+demo_iteration.py           发射端 demo：1 个正常 PAPR 压低 + 1 个零预算边界
 ```
 
 `tests/reference.py` 是与核心互相独立的发射端实现：朴素 IDFT、独立前导序列、
@@ -82,6 +96,45 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 
 其余接口：`dft(x)`（任意长度朴素 DFT，无归一化）、`symbols_to_bits(symbols)`。
 
+### 保留子载波 PAPR 压低（发射端，默认关闭）
+
+```python
+from ofdm_recovery import reduce_papr_tone_reservation, ToneReservationResult, FREE_CARRIERS
+```
+
+`reduce_papr_tone_reservation(data_symbols, reserved_carriers, *, target_papr_db, max_reserved_energy, max_iterations=128) -> ToneReservationResult`
+
+在**发射构造阶段**为一个 OFDM 符号（32 点，不含 CP）压低时域峰均比：
+只调整 `reserved_carriers` 指定的保留频点的复值，数据（±1..±6）、导频（±7）
+与 DC（0）频点保持不动。可选保留频点为 8..24（常量 `FREE_CARRIERS`）。
+**原发射/接收流程默认不使用该功能**，`decode` 接口与行为完全不变，
+接收端不需要任何新外部服务。
+
+* `data_symbols`：12 个复数 QPSK 符号（一个 OFDM 符号，顺序 -6..-1、+1..+6）。
+* `reserved_carriers`：DFT 索引列表，非空、不重复、在 0..31 内，
+  且**不得与数据/导频/DC 重叠**（重叠即拒绝，见错误语义）。
+* `target_papr_db`：目标峰均比（dB，>0）；`max_reserved_energy`：保留音调
+  总能量预算 `Σ|X[k]|²`（≥0，为 0 合法——保留音调被强制为 0）。
+
+算法为迭代投影：IDFT → 对超过目标幅度的样本求时域修正量 → 修正量只投影到
+保留频点 → 保留音调总能量超预算时整体等比缩回预算内 → 重复，直至达标或
+轮数耗尽。削峰阈值比目标内缩 0.1%，保证渐近收敛在有限轮数内落到目标之下。
+**停止后重新对时域做 DFT 逐点复核**数据/导频/DC 与输入一致（容差 1e-9），
+绝不直接裁剪时域波形破坏载荷。
+
+`ToneReservationResult` 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `time_signal` / `spectrum` | 压低后的 32 点时域符号与最终频域 |
+| `papr_history` | 每轮（含初始第 0 轮）的线性峰均比 |
+| `reserved_energy_history` / `reserved_energy` | 每轮及最终的保留音调实际总能量（≤ 预算） |
+| `target_papr` / `achieved` / `iterations` | 目标线性 PAPR、是否达标、实际轮数 |
+
+**达不到目标时 `achieved=False`，只如实报告最终 PAPR 与能量**——保留集合
+大小与能量预算决定自由度，库不承诺每组数据都能达标（例如 5 个音调、
+预算 4.0、目标 3 dB 的确定性尖峰符号串实测只能压到约 7.2 dB）。
+
 ### 错误语义（均可定位、不静默纠正）
 
 所有错误继承 `OFDMError(ValueError)`：
@@ -96,6 +149,7 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 | `FrameQualityError` | 最优候选残差 > `residual_threshold`（含“相关很高但幅度失配”的情形） |
 | `TruncatedFrameError` | 前导定位成功，但信号在 112 样本帧结束前截断 |
 | `ZeroPilotEnergyError` | ±7 导频能量低于总能量的 `1e-9` 相对底限，无法估计增益 |
+| `ReservedCarrierError` | 保留子载波集合为空、索引非整数/越界/重复，或与数据、导频、DC 重叠（消息指明哪个索引与哪种角色冲突） |
 
 整数参数（如 `max_candidates`）拒绝 `bool`；所有标量数值拒绝 NaN/Infinity。
 操作无共享可变状态（纯函数），失败即抛异常，不产生部分结果。
@@ -138,6 +192,10 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 * 无窗口/加权相关；强带内干扰下门限（0.85/0.35）可能需要调用方按场景调整。
 * 朴素 O(N²) DFT（N 固定 32），未做 FFT 优化——本题规模无此必要。
 * 不做 AGC、不输出软信息；DC 与空载波不参与判决。
+* 保留子载波压低是**发射端可选离线步骤**，逐符号独立处理；它改变发射
+  波形（保留频点叠加对消信号），接收端把保留频点当作空载波忽略即可，
+  不需要新的接收服务。压低能力受保留音调数量与能量预算限制，
+  不保证任意目标可达；`achieved=False` 时结果仍满足全部频域约束。
 
 ## demo 说明
 
@@ -145,3 +203,16 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 复增益 `1.7·exp(j0.6)`、固定种子噪声 0.05、帧尾噪声），实时打印恢复的
 起点、频偏、残差、增益与 48 位位串；然后构造一个前导可定位但在第二符号内
 截断的坏帧，实际抛出 `TruncatedFrameError`。无 sleep、无预录结果。
+
+## demo_iteration 说明
+
+`python demo_iteration.py` 用一串确定性的、多数载波同相的 QPSK 符号
+（时域在 n=0 附近有明显尖峰，初始 PAPR ≈ 6.6 dB）实时演示：
+
+1. **正常用例**：17 个保留音调（8..24）、能量预算 8.0、目标 4.0 dB，
+   逐轮打印 PAPR 与保留音调能量历史，约 128 轮内收敛到目标之下
+   （实测 < 0.5 s），并重新 DFT 复核数据/导频/DC 频点零偏差。
+2. **边界情况**：能量预算为 0——保留音调被强制为 0，PAPR 不可能改善，
+   结果如实报告 `achieved=False`、实际能量为 0，载荷频点保持不变。
+
+无 sleep、无预录结果，全部实时计算，远低于 90 秒预算。
