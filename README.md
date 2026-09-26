@@ -1,8 +1,13 @@
-# OFDM 循环前缀边界与子载波恢复（本题契约子集）
+# OFDM 循环前缀边界与子载波恢复 + 保留子载波压峰（本题契约子集）
 
-离线数字通信练习库：在含**时偏、频偏、复增益与前置噪声**的接收信号中定位
-N=32 / CP=8 的合成帧，估计载波频偏并补偿，去循环前缀后自行做 DFT，
-用已知导频估计单一复增益，最终判决恢复 QPSK 符号与位串。
+离线数字通信练习库，两部分：
+
+* **接收**：在含**时偏、频偏、复增益与前置噪声**的接收信号中定位
+  N=32 / CP=8 的合成帧，估计载波频偏并补偿，去循环前缀后自行做 DFT，
+  用已知导频估计单一复增益，最终判决恢复 QPSK 符号与位串。
+* **发射（可选，默认关闭）**：保留子载波（tone reservation）迭代投影压峰 ——
+  只在调用方指定的保留频点上写入复值，数据/导频/DC 保持不动，
+  降低时域峰均比（PAPR），并把保留音调总能量限制在预算内。
 
 **只实现题目定义的有限子集，不是、也不宣称兼容任何完整行业标准（如 802.11/LTE）。**
 
@@ -14,11 +19,21 @@ N=32 / CP=8 的合成帧，估计载波频偏并补偿，去循环前缀后自�
 * 核心算法（相关、频偏估计、DFT/IDFT、导频最小二乘、QPSK 判决）全部在
   `ofdm_recovery/core.py` 内手写，没有用第三方同类实现代替。
 
+## 环境准备（venv）
+
+无需任何第三方依赖，venv 可有可无；如需隔离环境：
+
+```bash
+python3.14 -m venv .venv          # 任意 Python 3.10+ 均可，验收版本 3.14.7
+source .venv/bin/activate         # 可选；不激活也能直接跑
+```
+
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试，约 0.05 s
-python demo.py                            # 固定输入演示，实测 < 0.1 s（远低于约 8 s 预算）
+python -m unittest discover -s tests -v   # 必要测试（39 个），实测 < 1 s
+python demo.py                            # 接收链路演示，实测 < 0.1 s
+python demo_iteration.py                  # 保留子载波压峰演示，实测 < 0.1 s（预算 90 s）
 ```
 
 ## 仓库结构
@@ -27,8 +42,10 @@ python demo.py                            # 固定输入演示，实测 < 0.1 s�
 ofdm_recovery/__init__.py   公开接口导出
 ofdm_recovery/core.py       核心库（DFT、候选搜索、解码、错误类型）
 tests/reference.py          独立直接合成器（不导入被测核心；期望值的唯一来源）
-tests/test_ofdm.py          必要测试（24 个）
+tests/test_ofdm.py          接收链路必要测试（24 个）
+tests/test_tone_reservation.py  压峰必要测试（15 个，自带独立直接 DFT 核对）
 demo.py                     固定输入 demo：1 个正常恢复 + 1 个实际触发的拒绝
+demo_iteration.py           压峰 demo：1 次实际压峰 + 1 个零预算边界
 ```
 
 `tests/reference.py` 是与核心互相独立的发射端实现：朴素 IDFT、独立前导序列、
@@ -82,6 +99,50 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 
 其余接口：`dft(x)`（任意长度朴素 DFT，无归一化）、`symbols_to_bits(symbols)`。
 
+### `reduce_papr(spectrum, reserved_carriers, *, target_papr_db, energy_budget, max_iterations=64) -> ToneReservationResult`
+
+发射侧保留子载波迭代投影压峰。**默认关闭**：原有接收链路与本库其它接口
+完全不经过它，只有显式调用才启用；`tests/reference.py` 的原始发射合成器
+保持原样，不使用该功能。
+
+* `spectrum`：长度 32 的频域 OFDM 符号（list/tuple，元素 int/float/complex），
+  数据/导频/DC 已就位。
+* `reserved_carriers`：保留频点 DFT 索引集合（list/tuple/set）。
+  合法频点是 `RESERVABLE_CARRIERS`（k=8..24，即非数据、非导频、非 DC 的零载波）；
+  与数据/导频重叠、含 DC、越界、重复、非整数一律抛 `ReservedCarrierError`。
+  空集合合法（无自由度，原样返回）。
+* `target_papr_db`：目标峰均比（dB），任意有限实数。
+* `energy_budget`：保留音调总能量上限 Σ|X[k]|²，有限实数且 ≥ 0；
+  `0` 合法（无自由度，原样返回）。
+* `max_iterations`：正整数迭代上限（默认 64），拒绝 bool。
+
+算法：每轮按目标（内部门限额外留 1.5 dB 余量防止收敛停滞）计算超门限
+时域残差，残差 DFT 后**只保留保留频点**（投影到保留子空间）并从频谱中
+减去，再把保留频点整体缩放回能量预算球内。裁剪只用于计算修正量 ——
+**发射波形始终是 `IDFT(原数据频谱 + 保留频点修正)`，从不直接裁剪时域
+波形**。停止（达标或迭代耗尽）后用直接 DFT 重新变换最终时域符号，
+强制核对数据/导频/DC 频点与输入一致（容差 1e-9 相对量级），不一致抛
+`OFDMError`（实现 bug），绝不静默放行。
+
+返回不可变 `ToneReservationResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `spectrum` | 最终频域符号；保护频点与输入一致，只有保留频点被写入 |
+| `time_domain` | 最终时域符号（`spectrum` 的 IDFT） |
+| `papr_db` | 最终峰均比（dB），取自历史最优一轮 |
+| `target_papr_db` / `target_reached` | 目标与是否达成；**达不到只报告 `False`，不抛异常、不承诺每组数据都有足够自由度** |
+| `reserved_energy` / `energy_budget` | 保留音调实际总能量与预算；保证 `reserved_energy ≤ budget`（1e-9 相对浮点容差内） |
+| `iterations` | 每轮 `PaprIteration(iteration, papr_db, reserved_energy)`，轮 0 为未调整的初始符号 |
+
+错误语义（均继承 `OFDMError(ValueError)`）：
+
+| 异常 | 触发条件 |
+|---|---|
+| `SignalFormatError` | `spectrum` 类型错、长度非 32、某频点为 NaN/Infinity/bool（消息带 `spectrum[i]`） |
+| `ReservedCarrierError` | 保留集合与数据/导频/DC 重叠、越界、重复、非整数、容器类型错 |
+| `ParameterError` | `target_papr_db`/`energy_budget` 非有限实数、预算为负、`max_iterations` 非正整数或 bool |
+
 ### 错误语义（均可定位、不静默纠正）
 
 所有错误继承 `OFDMError(ValueError)`：
@@ -128,6 +189,11 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
   （估计区间本身在 ±0.5 处分界）。信号长度 = 512（时偏 400+帧 112）可正常解码，
   长度 = 513 抛 `SignalFormatError`。
 * DFT 单元测试对已知变换对（冲激、直流、单频）误差 `< 1e-10`。
+* **压峰**：测试用测试文件自带的独立朴素 DFT/IDFT 核对（不调用被测核心）：
+  保护频点（数据/导频/DC/其余零载波）偏差 `< 1e-9`（相对频谱最大幅度）；
+  报告 PAPR 与独立实测 PAPR 偏差 `< 1e-9` dB；保留能量每轮 `≤ 预算`
+  （1e-9 相对容差内）。压峰幅度本身取决于保留频点数与能量预算，
+  库不承诺固定的 dB 改善量。
 
 ## 已知限制
 
@@ -138,6 +204,12 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 * 无窗口/加权相关；强带内干扰下门限（0.85/0.35）可能需要调用方按场景调整。
 * 朴素 O(N²) DFT（N 固定 32），未做 FFT 优化——本题规模无此必要。
 * 不做 AGC、不输出软信息；DC 与空载波不参与判决。
+* 压峰是简单的迭代投影（裁剪残差投影到保留子空间 + 能量球投影），
+  不是凸优化求解器：对给定目标可能收敛缓慢或达不到，此时只通过
+  `target_reached=False` 如实报告。内部门限留 1.5 dB 余量是固定启发式。
+* 保留频点上的额外能量会落在带内零载波区（k=8..24），占用少量带内频谱；
+  预算由调用方权衡。接收端无需任何改动：保留频点不参与判决，
+  导频增益估计不受影响。
 
 ## demo 说明
 
@@ -145,3 +217,9 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 复增益 `1.7·exp(j0.6)`、固定种子噪声 0.05、帧尾噪声），实时打印恢复的
 起点、频偏、残差、增益与 48 位位串；然后构造一个前导可定位但在第二符号内
 截断的坏帧，实际抛出 `TruncatedFrameError`。无 sleep、无预录结果。
+
+`python demo_iteration.py` 构造一个 12 个数据载波全同相的确定性高 PAPR
+频域符号（初始约 10.1 dB），用 10 个保留音调（k=8..12、20..24）在能量
+预算 6.0 内迭代压到 6.0 dB 目标以下，逐轮打印 PAPR 与保留能量，并核对
+数据/导频/DC 频点未变；随后演示零能量预算边界：无自由度时频谱原样返回、
+如实报告未达到目标。全部实时计算，实测远低于 90 秒预算。
