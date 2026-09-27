@@ -1,8 +1,9 @@
 """可导入的本题库：OFDM 循环前缀边界与子载波恢复。"""
 
 from .core import (
-    BLOCK_LEN,
-    CP_LEN,
+BLOCK_LEN,
+BadFrameStructureError,
+CP_LEN,
     DATA_CARRIERS,
     DecodeResult,
     Candidate,
@@ -25,9 +26,13 @@ from .core import (
     SearchBudgetError,
     SignalFormatError,
     SIGNED_DATA_CARRIERS,
+    StreamDecoder,
+    StreamStateError,
+    StreamStats,
     TruncatedFrameError,
     ZeroPilotEnergyError,
     decode,
+    decode_stream,
     dft,
     find_candidates,
     symbols_to_bits,
@@ -35,6 +40,7 @@ from .core import (
 
 __all__ = [
     "BLOCK_LEN",
+    "BadFrameStructureError",
     "CP_LEN",
     "DATA_CARRIERS",
     "DecodeResult",
@@ -58,9 +64,13 @@ __all__ = [
     "SearchBudgetError",
     "SignalFormatError",
     "SIGNED_DATA_CARRIERS",
+    "StreamDecoder",
+    "StreamStateError",
+    "StreamStats",
     "TruncatedFrameError",
     "ZeroPilotEnergyError",
     "decode",
+    "decode_stream",
     "dft",
     "find_candidates",
     "symbols_to_bits",

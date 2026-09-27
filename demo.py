@@ -1,4 +1,4 @@
-"""固定输入演示：真实计算一次正常恢复与一次实际触发的拒绝。
+"""固定输入演示：单帧恢复、流式逐帧恢复，以及两次实际触发的拒绝。
 
 运行：python demo.py
 数据由仓库内确定性独立合成器 tests/reference.py 生成，无网络、无预录结果。
@@ -68,7 +68,40 @@ def main() -> int:
         print("  错误：截断帧未被拒绝")
         return 1
 
-    print("\n演示完成：1 个正常恢复 + 1 个实际触发的拒绝，均为实时计算。")
+    # 3) 流式：两帧夹噪声，块边界任意（含每块 1 样本），逐帧返回。
+    f1 = R.build_frame(R.fixed_bits())
+    f2 = R.build_frame([(i * 7 + 3) % 2 for i in range(48)])
+    gap = R._noise(2026, 17, 0.02)
+    stream = f1 + gap + f2
+    chunks = [stream[i:i + 1] for i in range(len(stream))]  # 每块 1 样本
+    dec = O.StreamDecoder()
+    streamed = []
+    for ch in chunks:
+        streamed.extend(dec.feed(ch))
+    streamed.extend(dec.finish())
+    print("\n[流式] 逐样本喂入两帧（中间 17 个噪声样本）")
+    for r in streamed:
+        print(f"  帧 start={r.start:3d}  位串前 16 位={r.bits[:16]}")
+    if len(streamed) != 2 or streamed[0].start != 0 or \
+            streamed[1].start != O.FRAME_LEN + 17:
+        print("  错误：流式恢复结果不符")
+        return 1
+
+    # 4) 流式残缺：输入结束时前导完整但帧身未收齐，必须明确报告。
+    dec2 = O.StreamDecoder()
+    dec2.feed(R.build_frame(R.fixed_bits())[:45])
+    try:
+        dec2.finish()
+    except O.TruncatedFrameError as exc:
+        print("\n[流式残缺] 输入结束时剩余一个不完整帧：")
+        print(f"  已拒绝: {type(exc).__name__}: start={exc.start}, "
+              f"available={exc.available}, needed={exc.needed}")
+    else:
+        print("  错误：残缺帧未被报告")
+        return 1
+
+    print("\n演示完成：单帧恢复 + 流式逐帧恢复 + 2 个实际触发的拒绝，"
+          "均为实时计算。")
     return 0
 
 

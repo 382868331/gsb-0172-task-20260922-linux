@@ -44,6 +44,9 @@ DEFAULT_MAX_CANDIDATES = 1024
 
 CFO_LIMIT = 0.5  # 合法频偏估计区间 |f| < 0.5 个载波间隔
 _PILOT_REL_FLOOR = 1e-9
+# 空载波（DC 与 k=8..24）能量占每符号总能量的上限。
+# 真帧这些载波恒为 0；定时错误/假前导会使能量泄漏到空载波。
+_NULL_CARRIER_FLOOR = 0.05
 _QPSK = 1.0 / math.sqrt(2.0)
 
 
@@ -81,9 +84,25 @@ class FrameQualityError(OFDMError):
 class TruncatedFrameError(OFDMError):
     """找到了前导起点，但信号在两个 OFDM 符号结束前被截断。"""
 
+    def __init__(self, message: str, *, start: int | None = None,
+                 available: int | None = None, needed: int | None = None):
+        super().__init__(message)
+        # 残缺帧信息（流式接口在输入结束报告时一定带齐这三个字段）。
+        self.start = start
+        self.available = available
+        self.needed = needed
+
+
+class StreamStateError(OFDMError):
+    """流式接收器在结束之后又收到数据等非法状态转移。"""
+
 
 class ZeroPilotEnergyError(OFDMError):
     """导频载波能量为零（或低于相对底限），无法估计复增益。"""
+
+
+class BadFrameStructureError(OFDMError):
+    """候选通过前导检查，但空载波泄漏能量过高，帧定时/帧身不可信。"""
 
 
 # ---------------------------------------------------------------- 输入校验
@@ -295,7 +314,12 @@ def decode(
     residual_threshold: float = DEFAULT_RESIDUAL_THRESHOLD,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
 ) -> DecodeResult:
-    """离线恢复一帧。失败时抛出 ``OFDMError`` 的具体子类，不返回半结果。"""
+    """离线恢复一帧。失败时抛出 ``OFDMError`` 的具体子类，不返回半结果。
+
+    候选按 (残差, 起点) 排序后**逐个**验证：某个候选若被频偏、残差、
+    截断或零导频检查拒绝，继续尝试下一个候选，从而不跳过其后面真正的
+    帧；只有所有候选都被拒绝时，才报告排序最优候选对应的失败原因。
+    """
     sig = _validate_signal(signal)
     res_thr = _validate_threshold(residual_threshold, "residual_threshold")
     # find_candidates 内部会校验其余参数与信号。
@@ -309,32 +333,60 @@ def decode(
             "(proven absent under this contract, not a budget limit)"
         )
 
-    best = candidates[0]
+    first_error: OFDMError | None = None
+    for cand in candidates:
+        try:
+            return _decode_candidate(sig, cand, res_thr)
+        except TruncatedFrameError as exc:
+            if first_error is None:
+                first_error = exc
+        except FrequencyOffsetError as exc:
+            if first_error is None:
+                first_error = exc
+        except FrameQualityError as exc:
+            if first_error is None:
+                first_error = exc
+        except ZeroPilotEnergyError as exc:
+            if first_error is None:
+                first_error = exc
+        except BadFrameStructureError as exc:
+            if first_error is None:
+                first_error = exc
+    assert first_error is not None
+    raise first_error
 
-    if abs(best.frequency_offset) >= CFO_LIMIT:
+
+def _decode_candidate(
+    sig: list[complex], cand: Candidate, res_thr: float
+) -> DecodeResult:
+    """验证单个候选并解码；任一检查失败抛对应异常（供调用方换候选）。"""
+    if abs(cand.frequency_offset) >= CFO_LIMIT:
         raise FrequencyOffsetError(
-            f"estimated CFO at start {best.start} is "
-            f"{best.frequency_offset:.6f} carrier spacings; contract requires "
+            f"estimated CFO at start {cand.start} is "
+            f"{cand.frequency_offset:.6f} carrier spacings; contract requires "
             f"|f| < {CFO_LIMIT}"
         )
-    if best.residual > res_thr:
+    if cand.residual > res_thr:
         raise FrameQualityError(
-            f"best candidate at start {best.start} has preamble residual "
-            f"{best.residual:.6f} > residual_threshold={res_thr}"
+            f"candidate at start {cand.start} has preamble residual "
+            f"{cand.residual:.6f} > residual_threshold={res_thr}"
         )
 
-    end = best.start + FRAME_LEN
+    end = cand.start + FRAME_LEN
     if end > len(sig):
         raise TruncatedFrameError(
-            f"frame starts at {best.start} and needs {FRAME_LEN} samples "
+            f"frame starts at {cand.start} and needs {FRAME_LEN} samples "
             f"(through index {end - 1}), but signal has only {len(sig)} "
-            "samples"
+            "samples",
+            start=cand.start,
+            available=len(sig) - cand.start,
+            needed=FRAME_LEN,
         )
 
     # 全帧频偏补偿（时间原点取帧起点；绝对相位被导频增益吸收）。
-    omega = -2.0 * math.pi * best.frequency_offset / N_FFT
+    omega = -2.0 * math.pi * cand.frequency_offset / N_FFT
     seg = [
-        sig[best.start + n] * cmath.exp(1j * omega * n)
+        sig[cand.start + n] * cmath.exp(1j * omega * n)
         for n in range(FRAME_LEN)
     ]
 
@@ -360,10 +412,28 @@ def decode(
 
     if total_energy <= 0.0 or pilot_energy < _PILOT_REL_FLOOR * total_energy:
         raise ZeroPilotEnergyError(
-            "pilot carriers (+/-7) carry no usable energy "
-            f"(pilot/total energy ratio floor {_PILOT_REL_FLOOR:g}); "
-            "complex gain cannot be estimated"
+            f"candidate at start {cand.start}: pilot carriers (+/-7) carry "
+            "no usable energy (pilot/total energy ratio floor "
+            f"{_PILOT_REL_FLOOR:g}); complex gain cannot be estimated"
         )
+    # 空载波校验：k=0 与 k=8..24 在真帧恒为 0。定时偏差几个样本的假候选
+    # 前导相关也可能很好，但 DFT 后能量会泄漏进空载波。
+    for sym_idx, yk in enumerate(spectra):
+        sym_energy = sum(v.real * v.real + v.imag * v.imag for v in yk)
+        if sym_energy <= 0.0:
+            continue
+        null_energy = sum(
+            yk[k].real * yk[k].real + yk[k].imag * yk[k].imag
+            for k in range(8, 25)
+        ) + yk[0].real * yk[0].real + yk[0].imag * yk[0].imag
+        ratio = null_energy / sym_energy
+        if ratio > _NULL_CARRIER_FLOOR:
+            raise BadFrameStructureError(
+                f"candidate at start {cand.start} symbol {sym_idx}: null "
+                f"carriers leak {ratio:.4f} of symbol energy (> "
+                f"{_NULL_CARRIER_FLOOR}); frame timing/body not consistent "
+                "with the fixed subcarrier layout"
+            )
     gain = num / den
 
     symbols: list[complex] = []
@@ -373,10 +443,432 @@ def decode(
             symbols.append(_slice_qpsk(yk[k] / gain))
 
     return DecodeResult(
-        start=best.start,
-        frequency_offset=best.frequency_offset,
-        residual=best.residual,
+        start=cand.start,
+        frequency_offset=cand.frequency_offset,
+        residual=cand.residual,
         gain=gain,
         symbols=symbols,
         bits=symbols_to_bits(symbols),
     )
+
+
+# ---------------------------------------------------------------- 流式接收
+
+
+@dataclass(frozen=True)
+class StreamStats:
+    """流式接收器的可观测状态。
+
+    Attributes:
+        total_received: 历次 feed 接收并通过校验的样本总数。
+        frames_emitted: 已恢复并返回的帧数。
+        buffered: 当前内部保留（跨批次拼接）的样本数。
+    """
+
+    total_received: int
+    frames_emitted: int
+    buffered: int
+
+
+class StreamDecoder:
+    """从任意分块的连续输入中逐帧恢复结果。
+
+    用法::
+
+        dec = StreamDecoder()
+        results = []
+        for chunk in chunks:
+            results.extend(dec.feed(chunk))   # 每块可恢复 0..N 帧
+        results.extend(dec.finish())          # 无残缺时返回剩余帧
+
+    语义：
+
+    * 输入允许任意切分：块边界不必对齐帧头，尚未收完整的帧自动留到下一批；
+    * 帧间噪声中的**误识别候选帧头**在后续检查（频偏/残差/导频）失败后被
+      丢弃，搜索从该候选之后继续，绝不跳过后面真正的帧；
+    * 已经恢复的帧从搜索区间移除；与已恢复帧区间重叠的候选直接忽略；
+    * ``finish`` 时若仍有通过相关门限却收不完整的帧，抛
+      :class:`TruncatedFrameError`（异常带 ``start/available/needed``）；
+      纯噪声尾部不算残缺帧，作为 ``leftover_samples`` 保留/报告；
+    * 校验或搜索失败时本次调用不产生任何部分变更（先在临时副本上计算，
+      成功才提交），已返回的帧不受影响。
+    """
+
+    def __init__(
+        self,
+        *,
+        rho_threshold: float = DEFAULT_RHO_THRESHOLD,
+        residual_threshold: float = DEFAULT_RESIDUAL_THRESHOLD,
+        max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    ):
+        self._rho = _validate_threshold(rho_threshold, "rho_threshold")
+        self._res_thr = _validate_threshold(
+            residual_threshold, "residual_threshold"
+        )
+        self._budget = _validate_budget(max_candidates)
+        # _buf 为拼接缓冲；_base 为 _buf[0] 在整个流中的绝对下标。
+        self._buf: list[complex] = []
+        self._base = 0
+        # 已发射帧占用的绝对区间（互不重叠、按起点排序）。
+        self._emitted_spans: list[tuple[int, int]] = []
+        self._frames = 0
+        self._received = 0
+        self._done = False
+
+    # -------------------------------------------------- 属性 / 状态
+
+    @property
+    def frames_emitted(self) -> int:
+        return self._frames
+
+    @property
+    def total_received(self) -> int:
+        return self._received
+
+    @property
+    def is_finished(self) -> bool:
+        return self._done
+
+    @property
+    def buffered_samples(self) -> int:
+        return len(self._buf)
+
+    def stats(self) -> StreamStats:
+        return StreamStats(
+            total_received=self._received,
+            frames_emitted=self._frames,
+            buffered=len(self._buf),
+        )
+
+    def leftover_samples(self) -> int:
+        """流结束后残留的样本数（未构成可信帧的尾部）。
+
+        ``finish`` 成功后可调用；残缺帧情形应通过抛出的
+        ``TruncatedFrameError.available`` 获取残缺长度。
+        """
+        return len(self._buf)
+
+    # -------------------------------------------------- 输入
+
+    def feed(self, chunk) -> list[DecodeResult]:
+        """追加一个数据块，返回本批因此新恢复出的 0..N 帧。
+
+        空元组/空列表是合法的 no-op。任何异常都不改变接收器状态。
+        ``finish`` 之后再 feed 抛 :class:`StreamStateError`。
+        """
+        if self._done:
+            raise StreamStateError(
+                "stream already finished; create a new StreamDecoder for a "
+                "new stream"
+            )
+        if not isinstance(chunk, (list, tuple)):
+            raise SignalFormatError(
+                "chunk must be a list/tuple of numeric samples, got "
+                f"{type(chunk).__name__}"
+            )
+        if len(chunk) > MAX_SIGNAL_LEN:
+            raise SignalFormatError(
+                f"chunk length {len(chunk)} exceeds interface limit "
+                f"{MAX_SIGNAL_LEN}"
+            )
+        samples = [
+            _finite_complex(v, f"chunk[{i}]") for i, v in enumerate(chunk)
+        ]
+        if not samples:
+            return []
+
+        # 先在临时状态上计算，任何异常都不产生部分变更。
+        snapshot = (
+            list(self._buf), self._base, list(self._emitted_spans),
+            self._frames, self._received,
+        )
+        try:
+            self._buf.extend(samples)
+            self._received += len(samples)
+            emitted = self._pump(final=False)
+        except BaseException:
+            (
+                self._buf, self._base, self._emitted_spans,
+                self._frames, self._received,
+            ) = snapshot
+            raise
+        return emitted
+
+    def finish(self) -> list[DecodeResult]:
+        """宣布输入结束，返回最后能恢复的帧。
+
+        若缓冲中仍有通过相关门限、但样本不足以覆盖完整帧的候选，抛
+        :class:`TruncatedFrameError`（消息与 ``start/available/needed``
+        明确给出残缺位置与长度）；接收器状态保持在 finish 之前，调用方
+        仍可取用此前返回的全部帧。纯噪声/无候选尾部不报错。
+        重复调用为幂等 no-op。
+        """
+        if self._done:
+            return []
+        snapshot = (
+            list(self._buf), self._base, list(self._emitted_spans),
+            self._frames, self._received,
+        )
+        try:
+            emitted = self._pump(final=True)
+        except BaseException:
+            (
+                self._buf, self._base, self._emitted_spans,
+                self._frames, self._received,
+            ) = snapshot
+            raise
+        self._done = True
+        return emitted
+
+    # -------------------------------------------------- 内部
+
+    @staticmethod
+    def _overlaps_any(start: int, end: int,
+                      spans: list[tuple[int, int]]) -> bool:
+        for a, b in spans:
+            if start < b and a < end:
+                return True
+        return False
+
+    def _trim_buffer(self, keep_from_abs: int, *,
+                     hard_floor: int | None = None) -> None:
+        """丢弃绝对下标 keep_from_abs 之前的样本。
+
+        hard_floor 给出切点硬上界：调用方知道某个位置（最早存活候选，
+        或最后已发射帧的起点）之前的样本仍会被相关窗口引用时传入。
+        """
+        if hard_floor is not None and keep_from_abs > hard_floor:
+            keep_from_abs = hard_floor
+        if keep_from_abs <= self._base:
+            return
+        cut = keep_from_abs - self._base
+        if cut >= len(self._buf):
+            self._buf = []
+            self._base = keep_from_abs
+        else:
+            del self._buf[:cut]
+            self._base += cut
+
+    def _pump(self, *, final: bool) -> list[DecodeResult]:
+        """在当前缓冲上尽可能多地恢复帧。
+
+        候选按**起点升序**扫描，保证逐帧输出有序：
+
+        * 起点更早的候选帧身不完整且前导检查通过时，必须等待下一批，
+          不能越过它发射后面的帧（``final`` 时报残缺）；
+        * 完整候选按 (残差, 起点) 顺序逐个验证，任一检查失败就继续
+          下一个候选，误识别帧头不会跳过其后面真正的帧。
+        """
+        emitted: list[DecodeResult] = []
+        while True:
+            if len(self._buf) < PREAMBLE_LEN:
+                # 连一个完整前导窗口都放不下：保留全部样本等待后续；
+                # final 时它们作为纯尾部残留（不是残缺帧）。
+                return emitted
+            candidates = find_candidates(
+                self._buf,
+                rho_threshold=self._rho,
+                max_candidates=self._budget,
+            )
+            horizon2 = self._base + len(self._buf)
+            alive: list[Candidate] = []
+            for c in candidates:
+                start = self._base + c.start
+                if not self._overlaps_any(
+                    start, start + FRAME_LEN, self._emitted_spans
+                ):
+                    alive.append(
+                        Candidate(
+                            start,
+                            c.frequency_offset,
+                            c.residual,
+                            c.coherence,
+                        )
+                    )
+            complete = sorted(
+                (c for c in alive if c.start + FRAME_LEN <= horizon2),
+                key=lambda c: (c.residual, c.start),
+            )
+            incomplete_raw = [
+                c for c in alive
+                if c.start + FRAME_LEN > horizon2
+                and abs(c.frequency_offset) < CFO_LIMIT
+                and c.residual <= self._res_thr
+            ]
+            # 高原尾巴过滤：如果同一帧区间内已存在一个完整、残差更优
+            # （或残差相等但起点更靠后）的候选，这个不完整候选只是该
+            # 真前导在噪声里拖出的高原边缘，既不值得等待也不阻塞后面
+            # 的帧。真帧尚未收完整时（无完整优候选）则保留。
+            incomplete = []
+            for q in incomplete_raw:
+                explained = any(
+                    p.start + FRAME_LEN <= horizon2
+                    and q.start < p.start + FRAME_LEN
+                    and p.start < q.start + FRAME_LEN
+                    and (
+                        p.residual < q.residual - 1e-12
+                        or (abs(p.residual - q.residual) <= 1e-12
+                            and p.start > q.start)
+                    )
+                    for p in alive
+                )
+                if not explained:
+                    incomplete.append(q)
+
+            # 最早的不完整候选（可能是某帧的高原边缘或真起点）。
+            earliest_incomplete = (
+                min(incomplete, key=lambda c: c.start)
+                if incomplete else None
+            )
+
+            accepted: DecodeResult | None = None
+            accepted_cand: Candidate | None = None
+            # 按起点有序地处理“帧槽”：
+            # 槽起点 = 不被最早未决候选压过的最早完整候选；
+            # 槽内（与之帧区间重叠）的所有完整候选按残差选优验证。
+            # 起点晚于最早未决候选、且不与更早完整帧同槽的候选要等待。
+            ordered_complete = sorted(complete, key=lambda c: c.start)
+            slot_anchor: Candidate | None = None
+            for c in ordered_complete:
+                if earliest_incomplete is not None and \
+                        c.start >= earliest_incomplete.start:
+                    continue  # 未决候选之后：等它先落定
+                # 与未决候选重叠且残差更差 -> 高原假起点，跳过该候选，
+                # 继续找更早的真完整帧；若它就是最早完整候选则整槽等待。
+                if earliest_incomplete is not None and \
+                        c.start < earliest_incomplete.start + FRAME_LEN and \
+                        earliest_incomplete.start < c.start + FRAME_LEN and \
+                        earliest_incomplete.residual < c.residual - 1e-12:
+                    continue
+                slot_anchor = c
+                break
+            slot = []
+            if slot_anchor is not None:
+                slot = sorted(
+                    (
+                        c for c in complete
+                        if c.start < slot_anchor.start + FRAME_LEN
+                        and slot_anchor.start < c.start + FRAME_LEN
+                    ),
+                    key=lambda c: (c.residual, c.start),
+                )
+            for c in slot:
+                try:
+                    res = _decode_candidate(
+                        self._buf,
+                        Candidate(
+                            c.start - self._base,
+                            c.frequency_offset,
+                            c.residual,
+                            c.coherence,
+                        ),
+                        self._res_thr,
+                    )
+                except (FrequencyOffsetError, FrameQualityError,
+                        ZeroPilotEnergyError, BadFrameStructureError,
+                        TruncatedFrameError):
+                    # 误识别候选：只拒绝自己，继续尝试下一个候选，
+                    # 不跳过后面真正的帧。
+                    continue
+                accepted = DecodeResult(
+                    start=c.start,
+                    frequency_offset=res.frequency_offset,
+                    residual=res.residual,
+                    gain=res.gain,
+                    symbols=res.symbols,
+                    bits=res.bits,
+                )
+                accepted_cand = c
+                break
+
+            blocking: Candidate | None = None
+            if accepted_cand is None and earliest_incomplete is not None:
+                # 阻塞/残缺点：在最早未决候选的帧区间内选前导残差最优
+                # 者。高原边缘（残差更大）与真起点（残差 0）会同时出现，
+                # 残差点必须指向真正的帧定时。
+                region = [
+                    q for q in incomplete
+                    if q.start < earliest_incomplete.start + FRAME_LEN
+                    and earliest_incomplete.start < q.start + FRAME_LEN
+                ]
+                blocking = min(region, key=lambda c: (c.residual, c.start))
+
+            if blocking is not None:
+                if not final:
+                    hard_floor = (
+                        self._emitted_spans[-1][0]
+                        if self._emitted_spans else None
+                    )
+                    self._trim_buffer(
+                        blocking.start, hard_floor=hard_floor
+                    )
+                    return emitted
+                available = horizon2 - blocking.start
+                raise TruncatedFrameError(
+                    "stream ended with an incomplete frame: preamble starts "
+                    f"at {blocking.start} and needs {FRAME_LEN} samples but "
+                    f"only {available} are available (residual="
+                    f"{blocking.residual:.6f}); {self._frames} complete frame(s) "
+                    "were already recovered",
+                    start=blocking.start,
+                    available=available,
+                    needed=FRAME_LEN,
+                )
+
+            if accepted is not None:
+                assert accepted_cand is not None
+                emitted.append(accepted)
+                self._frames += 1
+                self._emitted_spans.append(
+                    (accepted.start, accepted.start + FRAME_LEN)
+                )
+                self._emitted_spans.sort()
+                # 切点不能越过任何仍存活候选的起点（其相关窗口可能跨
+                # 切点），也不能越过本帧起点（与本帧重叠的高原候选需要
+                # 帧前前导样本）。
+                hard_floor = min(
+                    min((c.start for c in alive),
+                        default=accepted.start + FRAME_LEN),
+                    accepted.start,
+                )
+                self._trim_buffer(
+                    accepted.start + FRAME_LEN - (PREAMBLE_LEN - 1),
+                    hard_floor=hard_floor,
+                )
+                continue
+
+            # 没有任何存活候选。最后 PREAMBLE_LEN-1 个样本即使相关窗口
+            # 目前已完整落入缓冲，其“第二块”内容还会随未来数据改变，
+            # 不能提前判死；任何尾部起点都可能随后续样本成为候选。
+            keep = self._base + max(
+                0, len(self._buf) - (PREAMBLE_LEN - 1)
+            )
+            hard_floor = (
+                self._emitted_spans[-1][0] if self._emitted_spans else None
+            )
+            self._trim_buffer(keep, hard_floor=hard_floor)
+            return emitted
+
+
+def decode_stream(
+    chunks,
+    *,
+    rho_threshold: float = DEFAULT_RHO_THRESHOLD,
+    residual_threshold: float = DEFAULT_RESIDUAL_THRESHOLD,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+) -> list[DecodeResult]:
+    """便捷封装：把一个可迭代的分块输入整体解码为帧列表。
+
+    内部逐块调用 :class:`StreamDecoder`，最后执行 ``finish``：因此输入
+    结束时若存在残缺帧，同样抛 :class:`TruncatedFrameError`。
+    """
+    dec = StreamDecoder(
+        rho_threshold=rho_threshold,
+        residual_threshold=residual_threshold,
+        max_candidates=max_candidates,
+    )
+    results: list[DecodeResult] = []
+    for chunk in chunks:
+        results.extend(dec.feed(chunk))
+    results.extend(dec.finish())
+    return results

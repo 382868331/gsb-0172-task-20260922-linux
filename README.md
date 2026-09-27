@@ -25,10 +25,11 @@ python demo.py                            # 固定输入演示，实测 < 0.1 s�
 
 ```
 ofdm_recovery/__init__.py   公开接口导出
-ofdm_recovery/core.py       核心库（DFT、候选搜索、解码、错误类型）
+ofdm_recovery/core.py       核心库（DFT、候选搜索、解码、流式接收、错误类型）
 tests/reference.py          独立直接合成器（不导入被测核心；期望值的唯一来源）
-tests/test_ofdm.py          必要测试（24 个）
-demo.py                     固定输入 demo：1 个正常恢复 + 1 个实际触发的拒绝
+tests/test_ofdm.py         单帧接口必要测试（24 个）
+tests/test_stream.py       流式接口必要测试（17 个，共 41 个）
+demo.py                    固定输入 demo：单帧 + 流式逐帧 + 2 个实际触发的拒绝
 ```
 
 `tests/reference.py` 是与核心互相独立的发射端实现：朴素 IDFT、独立前导序列、
@@ -55,7 +56,11 @@ QPSK 星座为 `±(1+j)/√2`。位映射：每位对应一个坐标，实部在
 ## 公开接口
 
 ```python
-from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeResult
+from ofdm_recovery import (
+    decode, decode_stream, StreamDecoder,
+    find_candidates, dft, symbols_to_bits,
+    DecodeResult, StreamStats,
+)
 ```
 
 ### `decode(signal, *, rho_threshold=0.85, residual_threshold=0.35, max_candidates=1024) -> DecodeResult`
@@ -82,6 +87,43 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 
 其余接口：`dft(x)`（任意长度朴素 DFT，无归一化）、`symbols_to_bits(symbols)`。
 
+### 流式接口：`StreamDecoder` 与 `decode_stream`
+
+`decode` 要求一次给齐一段信号；流式场景（输入任意分块、帧间夹噪声）用
+`StreamDecoder`，它内部跨批次拼接缓冲、逐帧返回恢复结果：
+
+```python
+dec = StreamDecoder(                 # 阈值参数与 decode 相同
+    rho_threshold=0.85, residual_threshold=0.35, max_candidates=1024)
+results = []
+for chunk in chunks:                 # 块边界任意，不必对齐帧头
+    results.extend(dec.feed(chunk))  # 每次返回 0..N 个 DecodeResult
+results.extend(dec.finish())         # 输入结束，返回最后一批帧
+```
+
+或一次性便捷封装：`results = decode_stream(chunks)`（内部逐块 `feed` 后
+`finish`）。流式结果的 `start` 是**整个流**中的绝对下标（不是块内下标）。
+
+关键语义：
+
+* **任意分块**：尚未收完整的帧（含前导刚收齐、帧身未到的情形）原样保留到
+  下一批，不丢样本；逐样本喂入也能恢复。每块上限 512 样本，空块是 no-op。
+* **误识别帧头不吞真帧**：候选帧头通过相关门限后，还要过频偏、残差、
+  导频等检查；任一检查失败就丢弃该候选并从其后继续搜索，不跳过后面
+  真正的帧（这与单帧 `decode` 的逐候选重试语义一致）。
+* **帧间噪声**：与已恢复帧区间重叠的候选直接忽略；穷举后证明无候选的
+  噪声前缀被丢弃（仅保留末尾 <32 个样本以防前导被块边界切断）。
+* **输入结束的残缺报告**：`finish()` 时若仍有**通过前导检查**但样本不足
+  112 的帧，抛 `TruncatedFrameError`，异常明确给出
+  `start`（流中绝对起点）、`available`（已有样本数）、`needed=112`；
+  残差/频偏就不合格的假前导与纯噪声尾部不算残缺帧。异常不改变接收器
+  状态，调用方补来剩余样本后可继续 `feed` + `finish`。
+* **失败原子性**：`feed` 在临时副本上计算，任何校验/搜索异常都不产生
+  部分变更（坏样本消息定位到 `chunk[i]`），此前已返回的帧不受影响。
+* 可观测属性：`frames_emitted`、`total_received`、`buffered_samples`、
+  `is_finished`、`leftover_samples()`、`stats() -> StreamStats`。
+  `finish` 之后再 `feed` 抛 `StreamStateError`；重复 `finish` 为幂等 no-op。
+
 ### 错误语义（均可定位、不静默纠正）
 
 所有错误继承 `OFDMError(ValueError)`：
@@ -96,6 +138,11 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 | `FrameQualityError` | 最优候选残差 > `residual_threshold`（含“相关很高但幅度失配”的情形） |
 | `TruncatedFrameError` | 前导定位成功，但信号在 112 样本帧结束前截断 |
 | `ZeroPilotEnergyError` | ±7 导频能量低于总能量的 `1e-9` 相对底限，无法估计增益 |
+| `BadFrameStructureError` | 候选通过前导检查，但空载波（DC、k=8..24）泄漏能量占比 > `0.05`，帧定时/帧身与固定子载波布局不一致 |
+| `StreamStateError` | 流式接收器已 `finish` 后又调用 `feed` |
+
+流式 `finish()` 的 `TruncatedFrameError` 额外带 `start/available/needed`
+字段，明确残缺位置与长度。
 
 整数参数（如 `max_candidates`）拒绝 `bool`；所有标量数值拒绝 NaN/Infinity。
 操作无共享可变状态（纯函数），失败即抛异常，不产生部分结果。
@@ -113,6 +160,21 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
    `h = Σ Y·conj(p)/Σ|p|²`（导频 ±1 时即平均），再逐数据载波 `Y/h` 后硬判决。
 5. 无插值/均衡/跟踪：契约只有一个平坦复增益。
 6. CP=8 足够吸收定时小幅滑动；起点判决以残差为准，残差相同选最早位置。
+7. **候选逐个验证而非一错即止**：单帧 `decode` 与流式接收器都按
+   (残差, 起点) 顺序逐个候选验证；频偏越界、残差过高、导频零能量、
+   空载波泄漏或帧身截断只拒绝当前候选，随后继续尝试下一个候选，因此
+   误识别的候选帧头不会跳过其后面真正的帧。全部候选都失败时，才报告
+   排序最优候选的失败原因。
+   **空载波校验**：k=0 与 k=8..24 在真帧恒为 0；CP 范围内的定时滑动
+   或假前导通过前导门限后，DFT 能量会泄漏到这些载波，用每符号 5% 的
+   泄漏上限把它们与正确帧边界分开（正确帧为 0）。
+8. **流式状态机**：`StreamDecoder` 用“绝对下标 + 拼接缓冲 + 已发射帧
+   区间”维护状态。每轮在缓冲上枚举候选，先排除与已恢复帧重叠者，
+   再按优先级验证；接受一帧后丢弃其结束位置之前的样本。最优候选帧身
+   不完整时保留缓冲等待下一批（不越过它发射更后的帧，保证输出有序）；
+   `finish` 时验完所有完整候选，仍有通过前导检查的不完整候选才报残缺。
+   缓冲长度上界约为“块上限 512 + 一个帧/前导窗口”，因为无候选区间会
+   被即时收缩。
 
 ## 浮点误差口径（明确，不用宽容差掩盖边界错误）
 
@@ -128,6 +190,10 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
   （估计区间本身在 ±0.5 处分界）。信号长度 = 512（时偏 400+帧 112）可正常解码，
   长度 = 513 抛 `SignalFormatError`。
 * DFT 单元测试对已知变换对（冲激、直流、单频）误差 `< 1e-10`。
+* **流式**：测试覆盖逐样本喂入、1/3/37 样本不规则分块、多帧+帧间噪声、
+  假前导后接真帧、前导/帧身跨批等待、`finish` 残缺报告（绝对起点与
+  available/needed）、坏批次原子性与 `finish` 后喂入拒绝；这些场景下
+  恢复的位串与起点与合成器输入精确一致。
 
 ## 已知限制
 
@@ -144,4 +210,15 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 `python demo.py` 用确定性独立合成器生成一帧（真实时偏 23、频偏 +0.137、
 复增益 `1.7·exp(j0.6)`、固定种子噪声 0.05、帧尾噪声），实时打印恢复的
 起点、频偏、残差、增益与 48 位位串；然后构造一个前导可定位但在第二符号内
-截断的坏帧，实际抛出 `TruncatedFrameError`。无 sleep、无预录结果。
+截断的坏帧，实际抛出 `TruncatedFrameError`。随后以**逐样本喂入**的
+`StreamDecoder` 从两帧夹噪声的连续流中逐帧返回恢复结果（起点为流内绝对
+下标），并在输入结束时对一个帧身未收齐的候选实际抛出带
+`start/available/needed` 的 `TruncatedFrameError`。无 sleep、无预录结果。
+
+## 流式接口的已知限制
+
+* 流本身没有长度上限，但单个 `feed` 块与 `decode` 一样受 512 样本接口
+  上限约束；内部缓冲约上界为 512 + 一个帧/前导窗口。
+* 逐帧输出按起点顺序返回：排序最优候选尚未收完整时，后面的帧即使已完整
+  也暂不发射（等下一批），以保证结果有序、区间不重叠。
+* 不做跨帧频偏/增益跟踪：每帧独立估计自己的频偏与单一复增益。
