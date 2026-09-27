@@ -27,8 +27,10 @@ python demo.py                            # 固定输入演示，实测 < 0.1 s�
 ofdm_recovery/__init__.py   公开接口导出
 ofdm_recovery/core.py       核心库（DFT、候选搜索、解码、错误类型）
 tests/reference.py          独立直接合成器（不导入被测核心；期望值的唯一来源）
-tests/test_ofdm.py          必要测试（24 个）
+tests/test_ofdm.py          离线接口必要测试
+tests/test_stream.py        流式多帧解码测试
 demo.py                     固定输入 demo：1 个正常恢复 + 1 个实际触发的拒绝
+                            + 流式多帧演示（任意分块、假帧头、残缺报告）
 ```
 
 `tests/reference.py` 是与核心互相独立的发射端实现：朴素 IDFT、独立前导序列、
@@ -55,7 +57,10 @@ QPSK 星座为 `±(1+j)/√2`。位映射：每位对应一个坐标，实部在
 ## 公开接口
 
 ```python
-from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeResult
+from ofdm_recovery import (
+    decode, find_candidates, dft, symbols_to_bits, DecodeResult,
+    StreamDecoder, StreamTail,
+)
 ```
 
 ### `decode(signal, *, rho_threshold=0.85, residual_threshold=0.35, max_candidates=1024) -> DecodeResult`
@@ -82,6 +87,36 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 
 其余接口：`dft(x)`（任意长度朴素 DFT，无归一化）、`symbols_to_bits(symbols)`。
 
+### 流式多帧解码：`StreamDecoder`
+
+`decode()` 面向“一整段信号里找一帧”的离线场景；`StreamDecoder` 面向连续
+输入流：输入可以**任意分块**（不要求对齐帧头），帧间允许夹噪声，每恢复一帧
+立即返回一个 `DecodeResult`（`start` 为整流**绝对**下标）。
+
+```python
+dec = StreamDecoder()            # 参数与 decode() 相同
+for chunk in chunks:             # 任意分块喂入
+    for result in dec.feed(chunk):
+        ...                      # 逐帧处理恢复结果
+results, tail = dec.finish()     # 冲刷缓冲 + 结束残留报告
+```
+
+语义（与离线接口共用同一套候选搜索与逐帧检查）：
+
+* 候选帧头的后续检查（残差 / 频偏 / 导频能量）失败时，**只否决该起点**
+  （记录绝对下标，永久有效），缓冲其余部分原样保留，继续搜索后面真正的帧；
+* 候选帧尚未收完整时留到下一批；若另一个残差更优且帧区间重叠的候选可能
+  随新数据到达，解码器会推迟裁决，保证**分块方式不影响最终结果**；
+* `finish()` 返回 `(最后恢复的帧列表, StreamTail)`；`StreamTail` 明确报告
+  残留：`leftover_samples`（未归属任何帧的样本数）、
+  `pending_frame_start`（已定位但未收完整的候选帧头绝对下标，无则 None）
+  与 `detail`（人类可读说明）；
+* 已证明不可能是帧头（相关窗口收齐且未过门限）的前缀作为噪声丢弃，
+  缓冲不随流长无限增长；`samples_consumed` 属性给出已消耗样本数；
+* `feed()`/`finish()` 抛错（如 `SearchBudgetError`）不改动解码器状态；
+  `finish()` 后再 `feed()`/`finish()` 抛 `StreamStateError`；
+* 流式输入块允许空块（无操作），不受离线接口 512 样本单次上限约束。
+
 ### 错误语义（均可定位、不静默纠正）
 
 所有错误继承 `OFDMError(ValueError)`：
@@ -96,6 +131,7 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 | `FrameQualityError` | 最优候选残差 > `residual_threshold`（含“相关很高但幅度失配”的情形） |
 | `TruncatedFrameError` | 前导定位成功，但信号在 112 样本帧结束前截断 |
 | `ZeroPilotEnergyError` | ±7 导频能量低于总能量的 `1e-9` 相对底限，无法估计增益 |
+| `StreamStateError` | `finish()` 之后继续 `feed()`/重复 `finish()` |
 
 整数参数（如 `max_candidates`）拒绝 `bool`；所有标量数值拒绝 NaN/Infinity。
 操作无共享可变状态（纯函数），失败即抛异常，不产生部分结果。
@@ -144,4 +180,7 @@ from ofdm_recovery import decode, find_candidates, dft, symbols_to_bits, DecodeR
 `python demo.py` 用确定性独立合成器生成一帧（真实时偏 23、频偏 +0.137、
 复增益 `1.7·exp(j0.6)`、固定种子噪声 0.05、帧尾噪声），实时打印恢复的
 起点、频偏、残差、增益与 48 位位串；然后构造一个前导可定位但在第二符号内
-截断的坏帧，实际抛出 `TruncatedFrameError`。无 sleep、无预录结果。
+截断的坏帧，实际抛出 `TruncatedFrameError`。随后演示流式多帧：把
+“噪声+帧1+噪声+假帧头+噪声+帧2+噪声+残缺帧头”按不对齐帧头的任意块尺寸
+喂入 `StreamDecoder`，逐帧打印恢复结果（假帧头被跳过后仍找到后面的真帧），
+并在 `finish()` 的 `StreamTail` 中报告结尾残缺帧头。无 sleep、无预录结果。

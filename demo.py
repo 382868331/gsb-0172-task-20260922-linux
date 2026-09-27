@@ -72,5 +72,72 @@ def main() -> int:
     return 0
 
 
+def stream_demo() -> int:
+    """流式多帧：任意分块、帧间噪声、假帧头跳过、结尾残缺报告。"""
+    print("\n" + "=" * 64)
+    print("流式多帧演示：连续输入任意分块，逐帧返回恢复结果")
+    print("=" * 64)
+
+    bits2 = [1 - b for b in R.fixed_bits()]
+    expected2 = "".join(str(b) for b in bits2)
+
+    # 流 = 噪声 + 帧1 + 噪声 + 假帧头 + 噪声 + 帧2 + 噪声 + 残缺帧头。
+    # 假帧头：前导第二块幅度失配（残差超门限），任何移位都会检查失败。
+    block = R._preamble_block()
+    fake = list(block) + [0.3 * x for x in block] + list(R._noise(4, 80, 0.5))
+    seg1 = R.transmit(R.fixed_bits(), time_offset=9, cfo=0.11,
+                      gain=1.4 * cmath.exp(0.3j), front_scale=0.05,
+                      inband_scale=0.05, seed=2024)
+    gap1 = R._noise(5, 13, 0.05)
+    gap2 = R._noise(6, 21, 0.05)
+    seg2 = R.transmit(bits2, time_offset=0, cfo=-0.18,
+                      gain=0.8 * cmath.exp(-0.5j), inband_scale=0.05,
+                      seed=7)
+    gap3 = R._noise(8, 15, 0.05)
+    partial = R.transmit(R.fixed_bits(), time_offset=0, cfo=0.05,
+                         seed=11, truncate=70)
+    stream = list(seg1) + list(gap1) + list(fake) + list(gap2) \
+        + list(seg2) + list(gap3) + list(partial)
+    true1 = 9
+    true2 = len(seg1) + len(gap1) + len(fake) + len(gap2)
+    true_partial = true2 + len(seg2) + len(gap3)
+
+    print(f"流总长 {len(stream)} 样本：帧1@{true1}、假帧头(残差超门限)、"
+          f"帧2@{true2}、残缺帧头@{true_partial}，帧间夹噪声")
+
+    dec = O.StreamDecoder()
+    results = []
+    pos = 0
+    sizes = [1, 37, 64, 5, 200]  # 任意分块，绝不对齐帧头
+    i = 0
+    t0 = time.perf_counter()
+    while pos < len(stream):
+        n = sizes[i % len(sizes)]
+        results.extend(dec.feed(stream[pos:pos + n]))
+        pos += n
+        i += 1
+    last, tail = dec.finish()
+    results.extend(last)
+    dt = time.perf_counter() - t0
+
+    print(f"按块尺寸 {sizes} 喂入，边到边解出 {len(results)} 帧 "
+          f"(假帧头已跳过)，耗时 {dt * 1000:.1f} ms")
+    ok = True
+    for idx, r in enumerate(results):
+        truth = (true1, "".join(str(b) for b in R.fixed_bits()))[0] \
+            if idx == 0 else true2
+        exp_bits = "".join(str(b) for b in R.fixed_bits()) \
+            if idx == 0 else expected2
+        match = r.bits == exp_bits
+        ok = ok and match and r.start == truth
+        print(f"  帧{idx + 1}: start={r.start} (真实 {truth})  "
+              f"f={r.frequency_offset:+.4f}  residual={r.residual:.4f}  "
+              f"位串匹配: {match}")
+    print(f"  结束残留: {tail.detail}")
+    ok = ok and tail.pending_frame_start == true_partial
+    print("  流式演示:", "全部符合预期" if ok else "与预期不符")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main() or stream_demo())

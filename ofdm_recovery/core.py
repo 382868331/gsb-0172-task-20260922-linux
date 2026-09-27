@@ -86,6 +86,10 @@ class ZeroPilotEnergyError(OFDMError):
     """导频载波能量为零（或低于相对底限），无法估计复增益。"""
 
 
+class StreamStateError(OFDMError):
+    """流式解码器状态非法：例如在 finish() 之后继续 feed()。"""
+
+
 # ---------------------------------------------------------------- 输入校验
 
 
@@ -127,6 +131,16 @@ def _validate_signal(signal) -> list[complex]:
             f"{MAX_SIGNAL_LEN}"
         )
     return [_finite_complex(v, f"signal[{i}]") for i, v in enumerate(signal)]
+
+
+def _validate_chunk(chunk) -> list[complex]:
+    """流式输入块：允许空块（无操作），不受 512 样本单次上限约束。"""
+    if not isinstance(chunk, (list, tuple)):
+        raise SignalFormatError(
+            "chunk must be a list/tuple of numeric samples, got "
+            f"{type(chunk).__name__}"
+        )
+    return [_finite_complex(v, f"chunk[{i}]") for i, v in enumerate(chunk)]
 
 
 def _validate_threshold(value, name: str) -> float:
@@ -205,7 +219,13 @@ def find_candidates(
     sig = _validate_signal(signal)
     thr = _validate_threshold(rho_threshold, "rho_threshold")
     budget = _validate_budget(max_candidates)
+    return _scan_candidates(sig, thr, budget)
 
+
+def _scan_candidates(
+    sig: list[complex], thr: float, budget: int
+) -> list[Candidate]:
+    """在已校验的复样本序列上穷举候选起点（供离线接口与流式解码共用）。"""
     candidates: list[Candidate] = []
     last = len(sig) - PREAMBLE_LEN
     for p in range(last + 1):
@@ -311,6 +331,17 @@ def decode(
 
     best = candidates[0]
 
+    result = _decode_frame_at(sig, best, res_thr)
+    return result
+
+
+def _decode_frame_at(
+    sig: list[complex], best: Candidate, res_thr: float
+) -> DecodeResult:
+    """对已选定的候选起点执行全部后续检查并恢复一帧。
+
+    供 decode() 与 StreamDecoder 共用；失败抛出具体 OFDMError 子类。
+    """
     if abs(best.frequency_offset) >= CFO_LIMIT:
         raise FrequencyOffsetError(
             f"estimated CFO at start {best.start} is "
@@ -380,3 +411,205 @@ def decode(
         symbols=symbols,
         bits=symbols_to_bits(symbols),
     )
+
+
+# ---------------------------------------------------------------- 流式多帧解码
+
+
+@dataclass(frozen=True)
+class StreamTail:
+    """输入结束时的残留报告。
+
+    Attributes:
+        leftover_samples: 结束时不属于任何已恢复帧、也未被消耗的样本数
+            （帧间噪声与/或残缺帧内容）。
+        pending_frame_start: 已定位但未收完整的候选帧头的**绝对**下标；
+            没有待定帧头时为 None。
+        detail: 人类可读的残留说明。
+    """
+
+    leftover_samples: int
+    pending_frame_start: int | None
+    detail: str
+
+
+class StreamDecoder:
+    """从连续输入流中逐帧恢复多帧的增量解码器。
+
+    输入可以任意分块（不必对齐帧头），帧间允许夹着噪声。用法::
+
+        dec = StreamDecoder()
+        for chunk in chunks:
+            for result in dec.feed(chunk):
+                ...   # result.start 为整流绝对下标
+        results, tail = dec.finish()
+
+    语义：
+
+    * 每次 feed() 返回本次新恢复的全部帧（可能为空列表）；
+    * 候选帧头后续检查（残差/频偏/导频能量）失败时，只跳过该起点
+      一个样本并继续搜索，不会跳过后面真正的帧；
+    * 尚未收完整的帧保留在内部缓冲，等下一批数据；finish() 时对仍
+      残缺的候选帧头在 StreamTail 中明确报告；
+    * 已证明不可能成为帧头（相关窗口已完整且不通过门限）的前缀样本
+      作为噪声丢弃，缓冲不会无限增长；
+    * feed()/finish() 抛出的错误（如 SearchBudgetError）不改动解码器
+      状态，可修正后重试；finish() 之后禁止再 feed()。
+    """
+
+    def __init__(
+        self,
+        *,
+        rho_threshold: float = DEFAULT_RHO_THRESHOLD,
+        residual_threshold: float = DEFAULT_RESIDUAL_THRESHOLD,
+        max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    ) -> None:
+        self._rho = _validate_threshold(rho_threshold, "rho_threshold")
+        self._res = _validate_threshold(
+            residual_threshold, "residual_threshold"
+        )
+        self._budget = _validate_budget(max_candidates)
+        self._buf: list[complex] = []
+        self._offset = 0  # self._buf[0] 在整流中的绝对下标
+        self._rejected: set[int] = set()  # 检查失败的候选帧头绝对下标
+        self._closed = False
+
+    @property
+    def samples_consumed(self) -> int:
+        """已确定归属（帧或噪声）的样本数，即当前缓冲起点的绝对下标。"""
+        return self._offset
+
+    def feed(self, chunk) -> list[DecodeResult]:
+        """追加一块输入，返回本次新恢复的帧（按起点升序）。"""
+        if self._closed:
+            raise StreamStateError(
+                "feed() after finish(): decoder is closed; "
+                "create a new StreamDecoder for a new stream"
+            )
+        samples = _validate_chunk(chunk)
+        # 在副本上处理，成功后才提交状态：抛错不留部分变更。
+        buf = self._buf + samples
+        results, buf, offset, rejected, _pending = self._drain(
+            buf, self._offset, set(self._rejected), final=False
+        )
+        self._buf = buf
+        self._offset = offset
+        self._rejected = rejected
+        return results
+
+    def finish(self) -> tuple[list[DecodeResult], StreamTail]:
+        """结束输入：冲刷缓冲，返回 (最后恢复的帧, 残留报告)。"""
+        if self._closed:
+            raise StreamStateError("finish() called twice")
+        results, buf, offset, rejected, pending = self._drain(
+            list(self._buf), self._offset, set(self._rejected), final=True
+        )
+        self._buf = buf
+        self._offset = offset
+        self._rejected = rejected
+        self._closed = True
+        if pending is not None:
+            start = offset + pending.start
+            have = len(buf) - pending.start
+            detail = (
+                f"input ended with an incomplete frame: candidate header at "
+                f"absolute index {start}, only {have} of {FRAME_LEN} "
+                f"frame samples received; "
+                f"{len(buf)} leftover sample(s) remain undecoded"
+            )
+            tail = StreamTail(
+                leftover_samples=len(buf),
+                pending_frame_start=start,
+                detail=detail,
+            )
+        else:
+            detail = (
+                f"input ended with {len(buf)} leftover sample(s) of "
+                "noise; no pending frame header"
+            )
+            tail = StreamTail(
+                leftover_samples=len(buf),
+                pending_frame_start=None,
+                detail=detail,
+            )
+        return results, tail
+
+    def _drain(
+        self,
+        buf: list[complex],
+        offset: int,
+        rejected: set[int],
+        final: bool,
+    ) -> tuple[list[DecodeResult], list[complex], int, set[int],
+               Candidate | None]:
+        """尽力从缓冲中逐帧恢复；返回 (结果, 剩余缓冲, 新偏移, 待定帧头)。"""
+        results: list[DecodeResult] = []
+        pending: Candidate | None = None
+        while True:
+            candidates = _scan_candidates(buf, self._rho, self._budget)
+            if rejected:
+                candidates = [
+                    c for c in candidates
+                    if offset + c.start not in rejected
+                ]
+            if not candidates:
+                if not final:
+                    # 起点 p 的相关窗口为 [p, p+32)：p <= len-32 的位置已
+                    # 完全确定且未通过门限，只保留末尾 31 个样本即可。
+                    keep = PREAMBLE_LEN - 1
+                    if len(buf) > keep:
+                        drop = len(buf) - keep
+                        buf = buf[drop:]
+                        offset += drop
+                break
+            complete = [
+                c for c in candidates if c.start + FRAME_LEN <= len(buf)
+            ]
+            if not complete:
+                # 最早的可用候选帧还没收完整：留到下一批（或 finish 报告）。
+                pending = candidates[0]
+                break
+            best = complete[0]
+            # 若某个残差更优的候选与 best 的帧区间重叠、但帧尚未收完整，
+            # 现在解码 best 会抢占可能更好的起点 —— 等下一批再裁决。
+            blocker = None
+            for c in candidates:
+                if c.residual >= best.residual:
+                    break  # 候选按残差升序，之后的不会更优
+                if (abs(c.start - best.start) < FRAME_LEN
+                        and c.start + FRAME_LEN > len(buf)):
+                    blocker = c
+                    break
+            if blocker is not None:
+                pending = blocker
+                break
+            try:
+                result = _decode_frame_at(buf, best, self._res)
+            except (FrameQualityError, FrequencyOffsetError,
+                    ZeroPilotEnergyError):
+                # 假帧头：只否决该起点（永久：检查只依赖已收齐的样本），
+                # 缓冲其余部分原样保留，继续搜索后面真正的帧。
+                rejected.add(offset + best.start)
+                continue
+            results.append(
+                DecodeResult(
+                    start=offset + best.start,
+                    frequency_offset=result.frequency_offset,
+                    residual=result.residual,
+                    gain=result.gain,
+                    symbols=result.symbols,
+                    bits=result.bits,
+                )
+            )
+            buf = buf[best.start + FRAME_LEN:]
+            offset += best.start + FRAME_LEN
+        if pending is not None and pending.start > 0:
+            # 待定帧头之前的位置相关窗口已完整且未通过门限，是确定的噪声。
+            buf = buf[pending.start:]
+            offset += pending.start
+            pending = Candidate(
+                0, pending.frequency_offset, pending.residual,
+                pending.coherence,
+            )
+        rejected = {r for r in rejected if r >= offset}
+        return results, buf, offset, rejected, pending
